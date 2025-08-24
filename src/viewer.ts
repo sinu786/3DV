@@ -31,6 +31,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   renderer.toneMapping = THREE.ACESFilmicToneMapping
   renderer.toneMappingExposure = 1.0
   renderer.xr.enabled = true
+  renderer.xr.setReferenceSpaceType('local') // 'local' also available
   mount.appendChild(renderer.domElement)
 
   // XR Buttons
@@ -90,19 +91,22 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     const gltf = await loader.loadAsync(url)
     model = gltf.scene
   
-    // Search for "SpawnPoint" node
-    const spawn = model.getObjectByName("SpawnPoint")
+    // Try to find SpawnPoint inside the GLB
+    const spawn = model.getObjectByName('SpawnPoint')
   
     if (spawn) {
-      // Make SpawnPoint the pivot: move model so SpawnPoint sits at world origin (0,0,0)
+      // Bring SpawnPoint to world origin with identity orientation:
+      // Apply the inverse of SpawnPoint's world matrix to the whole model.
+      spawn.updateWorldMatrix(true, true)
       const inv = new THREE.Matrix4().copy(spawn.matrixWorld).invert()
-      model.applyMatrix4(inv) 
+      model.applyMatrix4(inv)
   
-      // Optionally, drop SpawnPoint marker (invisible in final)
-      // spawn.visible = false
-      console.log("[SpawnPoint] Found and aligned model to", spawn.position)
+      // ✅ Do NOT lift/scale when SpawnPoint exists.
+      // Assume you authored correct size/orientation in DCC.
+      console.log('[SpawnPoint] Found — aligned model to SpawnPoint.')
     } else {
-      // Fallback: center/scale if no SpawnPoint
+      console.warn('[SpawnPoint] Not found — using auto center/scale.')
+      // Fallback: normalize size & position for a good default
       const box = new THREE.Box3().setFromObject(model)
       const size = new THREE.Vector3(); box.getSize(size)
       const center = new THREE.Vector3(); box.getCenter(center)
@@ -110,8 +114,8 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       const targetHeight = 1.5
       const scale = targetHeight / (size.y || 1.0)
       model.scale.setScalar(scale)
+      // Remove this if you want exact center at floor; the fallback lifts a bit for presentation
       model.position.y = 1.0
-      console.warn("[SpawnPoint] Not found — used auto center/scale")
     }
   
     model.traverse((o: any) => {
@@ -124,6 +128,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   
     scene.add(model)
   }
+  
   
 
   if (cfg.hdriUrl) await loadHDRI(cfg.hdriUrl)
