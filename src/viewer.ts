@@ -31,8 +31,12 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   renderer.toneMapping = THREE.ACESFilmicToneMapping
   renderer.toneMappingExposure = 1.0
   renderer.xr.enabled = true
-  renderer.xr.setReferenceSpaceType('local') // 'local' also available
+  renderer.xr.setReferenceSpaceType('local-floor') // 'local' also available
   mount.appendChild(renderer.domElement)
+
+ 
+
+
 
   // XR Buttons
   const vrBtn = VRButton.createButton(renderer)
@@ -56,6 +60,16 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   controls.target.set(0, 1.2, 0)
   controls.enableDamping = true
 
+  
+  const rig = new THREE.Group()
+  rig.name = 'Rig'
+  scene.add(rig)
+  rig.add(camera)
+
+  const teleportables: THREE.Object3D[] = []
+  
+
+
   renderer.xr.addEventListener('sessionstart', () => { controls.enabled = false })
   renderer.xr.addEventListener('sessionend',   () => { controls.enabled = true })
 
@@ -64,9 +78,20 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     new THREE.CircleGeometry(6, 64).rotateX(-Math.PI / 2),
     new THREE.MeshStandardMaterial({ color: 0x1c2430, metalness: 0.0, roughness: 0.9 })
   )
-  floor.position.y = 0
-  scene.add(floor)
+  // Replace your floor with an invisible, large ground plane used for teleport only
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(200, 200).rotateX(-Math.PI / 2),
+  new THREE.MeshStandardMaterial({ color: 0x111416, roughness: 1, metalness: 0, transparent: true, opacity: 0 })
+)
 
+  // If you kept the invisible ground:
+  teleportables.push(ground)
+
+
+ground.position.y = 0
+ground.name = 'TeleportGround'
+;(ground as any).userData.teleportable = true
+scene.add(ground)
   // Lighting (ambient add for non-HDR case)
   const hemi = new THREE.HemisphereLight(0xffffff, 0x404040, 0.4)
   scene.add(hemi)
@@ -141,7 +166,25 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     initialPos  = model.position.clone()
   }
   
-  
+ 
+  model.traverse((o: any) => {
+    if (o.isMesh && (o.name.toLowerCase().includes('floor') || o.userData.teleportable)) {
+      teleportables.push(o)
+    }
+  })
+  const raycaster = new THREE.Raycaster()
+const mouse = new THREE.Vector2()
+const tmpMat = new THREE.Matrix4()
+const tmpVec = new THREE.Vector3()
+
+function teleportTo(point: THREE.Vector3) {
+  // With local-floor, keep y at 0 so headset height is handled by XR
+  rig.position.set(point.x, 0, point.z)
+  // Make desktop orbit feel natural
+  controls.target.set(point.x, 1.2, point.z)
+  controls.update()
+}
+
   
 
   if (cfg.hdriUrl) await loadHDRI(cfg.hdriUrl)
@@ -161,6 +204,56 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     scene.add(cube)
     model = cube
   }
+  renderer.domElement.addEventListener('pointerdown', (e) => {
+    if (renderer.xr.isPresenting) return // mouse disabled in VR
+    const rect = renderer.domElement.getBoundingClientRect()
+    mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1
+    mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1
+    raycaster.setFromCamera(mouse, camera)
+    const hits = raycaster.intersectObjects(teleportables, true)
+    if (hits[0]) teleportTo(hits[0].point)
+  })
+  // Controller 0 (right hand on Quest)
+const ctrl0 = renderer.xr.getController(0)
+rig.add(ctrl0)
+
+// Ray line
+const rayGeom = new THREE.BufferGeometry().setFromPoints([
+  new THREE.Vector3(0, 0, 0),
+  new THREE.Vector3(0, 0, -1)
+])
+const rayLine = new THREE.Line(rayGeom, new THREE.LineBasicMaterial())
+rayLine.name = 'ray'
+rayLine.scale.z = 10
+ctrl0.add(rayLine)
+
+ctrl0.addEventListener('select', () => {
+  // Build a world-space ray from controller
+  tmpMat.identity().extractRotation(ctrl0.matrixWorld)
+  raycaster.ray.origin.setFromMatrixPosition(ctrl0.matrixWorld)
+  raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpMat)
+  const hits = raycaster.intersectObjects(teleportables, true)
+  if (hits[0]) teleportTo(hits[0].point)
+})
+
+// Controller 0 (right hand on Quest)
+const ctrl1 = renderer.xr.getController(0)
+rig.add(ctrl1)
+
+  new THREE.Vector3(0, 0, 0),
+  new THREE.Vector3(0, 0, -1)
+rayLine.name = 'ray'
+rayLine.scale.z = 10
+ctrl0.add(rayLine)
+
+ctrl0.addEventListener('select', () => {
+  // Build a world-space ray from controller
+  tmpMat.identity().extractRotation(ctrl1.matrixWorld)
+  raycaster.ray.origin.setFromMatrixPosition(ctrl1.matrixWorld)
+  raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpMat)
+  const hits = raycaster.intersectObjects(teleportables, true)
+  if (hits[0]) teleportTo(hits[0].point)
+})
 
   // Animate
   const clock = new THREE.Clock()
