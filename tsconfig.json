@@ -9,9 +9,7 @@
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "types": ["vite/client", "three"],
-    "baseUrl": ".",
-    "typeRoots": ["./node_modules/@types", "./src/types"]
+    "baseUrl": "."
   },
-  "include": ["src", "src/types"]
+  "include": ["src"]
 }
