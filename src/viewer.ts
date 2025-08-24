@@ -51,6 +51,8 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   camera.position.set(0, 1.6, 2.5)
 
   const controls = new OrbitControls(camera, renderer.domElement)
+  controls.autoRotate = false
+  controls.autoRotateSpeed = 0.5
   controls.target.set(0, 1.2, 0)
   controls.enableDamping = true
 
