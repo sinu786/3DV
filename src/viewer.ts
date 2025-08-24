@@ -58,7 +58,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
 
   // Floor
   const floor = new THREE.Mesh(
-    new THREE.CircleGeometry(6, 64).rotateX(-Math.PI/2),
+    new THREE.CircleGeometry(6, 64).rotateX(0),
     new THREE.MeshStandardMaterial({ color: 0x1c2430, metalness: 0.0, roughness: 0.9 })
   )
   floor.position.y = 0
