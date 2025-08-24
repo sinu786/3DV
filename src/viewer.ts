@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls'   // ⬅ no `.js`
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls'
 import { VRButton } from 'three/examples/jsm/webxr/VRButton'
 import { ARButton } from 'three/examples/jsm/webxr/ARButton'
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader'
