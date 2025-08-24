@@ -52,7 +52,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
 
   const controls = new OrbitControls(camera, renderer.domElement)
   controls.autoRotate = false
-  controls.autoRotateSpeed = 0.5
+  controls.autoRotateSpeed = 0.0
   controls.target.set(0, 1.2, 0)
   controls.enableDamping = true
 
@@ -61,7 +61,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
 
   // Floor
   const floor = new THREE.Mesh(
-    new THREE.CircleGeometry(6, 64).rotateX(0),
+    new THREE.CircleGeometry(6, 64).rotateX(-Math.PI / 2),
     new THREE.MeshStandardMaterial({ color: 0x1c2430, metalness: 0.0, roughness: 0.9 })
   )
   floor.position.y = 0
@@ -88,27 +88,34 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   }
 
   let model: THREE.Object3D | undefined
+  let mixer: THREE.AnimationMixer | undefined
+  let initialQuat: THREE.Quaternion | null = null
+  let initialPos: THREE.Vector3 | null = null
+  
   async function loadGLB(url: string) {
     const loader = new GLTFLoader()
     const gltf = await loader.loadAsync(url)
     model = gltf.scene
   
-    // Try to find SpawnPoint inside the GLB
-    const spawn = model.getObjectByName('SpawnPoint')
+    // 🔹 Stop clips if the GLB has a “turntable” animation baked in
+    if (gltf.animations && gltf.animations.length) {
+      mixer = new THREE.AnimationMixer(model)
+      gltf.animations.forEach((clip) => {
+        const action = mixer!.clipAction(clip)
+        action.stop()
+        action.enabled = false
+      })
+    }
   
+    // SpawnPoint logic (unchanged)
+    const spawn = model.getObjectByName('SpawnPoint')
     if (spawn) {
-      // Bring SpawnPoint to world origin with identity orientation:
-      // Apply the inverse of SpawnPoint's world matrix to the whole model.
       spawn.updateWorldMatrix(true, true)
       const inv = new THREE.Matrix4().copy(spawn.matrixWorld).invert()
       model.applyMatrix4(inv)
-  
-      // ✅ Do NOT lift/scale when SpawnPoint exists.
-      // Assume you authored correct size/orientation in DCC.
       console.log('[SpawnPoint] Found — aligned model to SpawnPoint.')
     } else {
       console.warn('[SpawnPoint] Not found — using auto center/scale.')
-      // Fallback: normalize size & position for a good default
       const box = new THREE.Box3().setFromObject(model)
       const size = new THREE.Vector3(); box.getSize(size)
       const center = new THREE.Vector3(); box.getCenter(center)
@@ -116,7 +123,6 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       const targetHeight = 1.5
       const scale = targetHeight / (size.y || 1.0)
       model.scale.setScalar(scale)
-      // Remove this if you want exact center at floor; the fallback lifts a bit for presentation
       model.position.y = 1.0
     }
   
@@ -129,7 +135,12 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     })
   
     scene.add(model)
+  
+    // 🔹 Capture initial transform for hard lock
+    initialQuat = model.quaternion.clone()
+    initialPos  = model.position.clone()
   }
+  
   
   
 
