@@ -1,5 +1,6 @@
 import * as THREE from 'three'
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls'
+import { OrbitControls as OrbitControlsImpl } from 'three/examples/jsm/controls/OrbitControls'
+import type { OrbitControls as OrbitControlsType } from 'three/examples/jsm/controls/OrbitControls'
 import { VRButton } from 'three/examples/jsm/webxr/VRButton'
 import { ARButton } from 'three/examples/jsm/webxr/ARButton'
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader'
@@ -15,7 +16,7 @@ export type ViewerHandle = {
   renderer: THREE.WebGLRenderer
   scene: THREE.Scene
   camera: THREE.PerspectiveCamera
-  controls: OrbitControls
+  controls: OrbitControlsType
   model?: THREE.Object3D
   toggleBackground: () => void
   resetCamera: () => void
@@ -51,7 +52,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   scene.add(rig)
 
   // Desktop controls
-  const controls = new OrbitControls(camera, renderer.domElement)
+  const controls = new OrbitControlsImpl(camera, renderer.domElement) as OrbitControlsType
   controls.autoRotate = false
   controls.autoRotateSpeed = 0
   controls.target.set(0, 1.2, 0)
