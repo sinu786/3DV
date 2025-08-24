@@ -161,7 +161,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
 
   const loop = () => {
     const t = clock.getElapsedTime()
-    if (model) model.rotation.y = t * 0.1
+   // if (model) model.rotation.y = t * 0.1
     if (!renderer.xr.isPresenting) controls.update()
     renderer.render(scene, camera)
   }
