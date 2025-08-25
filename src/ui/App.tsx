@@ -38,7 +38,7 @@ export default function App() {
           <button onClick={() => handle?.toggleBackground?.()}>
             Toggle HDRI Background
           </button>
-          <button style={{ marginLeft: 8 }} onClick={() => handle?.resetCamera?.()}>
+          <button style={{ marginLeft: 8 }} onClick={() => handle?.resetView?.()}>
             Reset Camera
           </button>
         </div>
