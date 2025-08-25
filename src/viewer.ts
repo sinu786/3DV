@@ -1,17 +1,28 @@
+// src/viewer.ts
 import * as THREE from 'three'
-import { OrbitControls as OrbitControlsImpl } from 'three/examples/jsm/controls/OrbitControls'
 import { VRButton } from 'three/examples/jsm/webxr/VRButton'
 import { ARButton } from 'three/examples/jsm/webxr/ARButton'
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader'
 import { Pathfinding } from 'three-pathfinding'
 
-const _normal = new THREE.Vector3()
-const _quat = new THREE.Quaternion()
-const _mat3 = new THREE.Matrix3()
+// ---------- tuning ----------
+const EYE_HEIGHT = 1.6
+const LOOK_SENS_MOUSE = 0.0022  // radians per pixel
+const LOOK_SENS_TOUCH = 0.005   // radians per pixel (drag)
+const LOOK_PITCH_LIMIT = THREE.MathUtils.degToRad(85) // up/down clamp
+const MOVE_SPEED = 2.0          // m/s for smooth desktop/mobile move
+const CLICK_PX = 6              // click vs drag threshold
+const CLICK_MS = 300            // click max press time
+// ----------------------------
 
-// derive the instance type from the class
-type Controls = InstanceType<typeof OrbitControlsImpl>
+// scratch utils to reduce GC
+const _normal = new THREE.Vector3()
+const _quat   = new THREE.Quaternion()
+const _mat3   = new THREE.Matrix3()
+const _dir    = new THREE.Vector3()
+const _tmpV   = new THREE.Vector3()
+const _tmpV2  = new THREE.Vector3()
 
 export type ViewerConfig = {
   modelUrl?: string
@@ -24,14 +35,15 @@ export type ViewerHandle = {
   renderer: THREE.WebGLRenderer
   scene: THREE.Scene
   camera: THREE.PerspectiveCamera
-  controls: Controls
+  rig: THREE.Group
   model?: THREE.Object3D
   toggleBackground: () => void
-  resetCamera: () => void
+  resetView: () => void
   mount: HTMLElement
 }
 
 export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Promise<ViewerHandle> {
+  // --- Renderer / XR ---
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false })
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
   renderer.setSize(mount.clientWidth, mount.clientHeight)
@@ -42,7 +54,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   renderer.xr.setReferenceSpaceType('local-floor')
   mount.appendChild(renderer.domElement)
 
-  // XR Buttons
+  // XR buttons
   const vrBtn = VRButton.createButton(renderer)
   const arBtn = ARButton.createButton(renderer, { requiredFeatures: [] })
   Object.assign(vrBtn.style, { position: 'fixed', right: '12px', bottom: '12px' })
@@ -50,72 +62,73 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   document.body.appendChild(vrBtn)
   document.body.appendChild(arBtn)
 
-  const scene = new THREE.Scene()
+  // --- Scene / Camera rig (first-person) ---
+  const scene  = new THREE.Scene()
   const camera = new THREE.PerspectiveCamera(70, mount.clientWidth / mount.clientHeight, 0.01, 1000)
 
-  // Rig (we move this when teleporting)
   const rig = new THREE.Group()
   rig.name = 'Rig'
-  rig.add(camera)
   scene.add(rig)
 
-  // Desktop controls
-  const controls: Controls = new OrbitControlsImpl(camera, renderer.domElement)
-  controls.autoRotate = false
-  controls.autoRotateSpeed = 0
-  controls.target.set(0, 1.2, 0)
-  controls.enableDamping = true
+  // Yaw (horizontal), Pitch (vertical)
+  const yaw = new THREE.Object3D(); yaw.name = 'Yaw'
+  const pitch = new THREE.Object3D(); pitch.name = 'Pitch'
+  rig.add(yaw)
+  yaw.add(pitch)
+  pitch.add(camera)
 
-  renderer.xr.addEventListener('sessionstart', () => { controls.enabled = false })
-  renderer.xr.addEventListener('sessionend',   () => { controls.enabled = true })
+  // eye height
+  yaw.position.set(0, 0, 0)
+  pitch.position.set(0, EYE_HEIGHT, 0)
+  camera.position.set(0, 0, 0)
 
-  // Invisible teleport ground: raycastable, non-visual, non-occluding
+  // initial view
+  rig.position.set(0, 0, 2.5)
+  yaw.rotation.y = 0
+  pitch.rotation.x = 0
+
+  // Lights
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x404040, 0.4))
+
+  // PMREM
+  const pmrem = new THREE.PMREMGenerator(renderer)
+  pmrem.compileEquirectangularShader()
+
+  // Invisible ground (fallback ray/teleport target)
   const groundMat = new THREE.MeshStandardMaterial({ color: 0x111416, transparent: true, opacity: 0 })
   groundMat.depthWrite = false
   groundMat.colorWrite = false
   groundMat.side = THREE.DoubleSide
-
-  const ground = new THREE.Mesh(new THREE.PlaneGeometry(200, 200).rotateZ(-Math.PI / 2), groundMat)
-  ground.position.y = 0
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(200, 200).rotateX(-Math.PI / 2),
+    groundMat
+  )
   ground.name = 'TeleportGround'
   ;(ground as any).userData.teleportable = true
   scene.add(ground)
 
-  // Light (HDRI will provide most of the look)
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x404040, 0.4))
-
-  // HDRI prefilter
-  const pmrem = new THREE.PMREMGenerator(renderer)
-  pmrem.compileEquirectangularShader()
-
-  // Teleport targets
+  // Teleportable set
   const teleportables: THREE.Object3D[] = [ground]
 
-  // Navmesh & targeting
+  // Navmesh
   const pathfinder = new Pathfinding()
   const ZONE = 'level'
   let modelXform = new THREE.Matrix4().identity()
   let navReady = false
   let navRayMesh: THREE.Mesh<THREE.BufferGeometry, THREE.Material> | null = null
 
+  // Marker (center reticle target)
   const aimPoint = new THREE.Vector3()
   const marker = new THREE.Mesh(
-    new THREE.RingGeometry(0.15, 0.22, 40, 1),   // cleaner reticle
+    new THREE.RingGeometry(0.15, 0.22, 40, 1),
     new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.6, side: THREE.DoubleSide })
   )
   ;(marker.material as THREE.MeshBasicMaterial).depthTest = false
   marker.renderOrder = 999
   marker.visible = false
   scene.add(marker)
-  
 
-  // Smooth locomotion (desktop/mobile)
-  let path: THREE.Vector3[] = []
-  let pathIdx = 0
-  const MOVE_SPEED = 2.0 // m/s
-
-  const clock = new THREE.Clock()
-
+  // Assets
   let envMap: THREE.Texture | null = null
   let model: THREE.Object3D | undefined
   let mixer: THREE.AnimationMixer | undefined
@@ -132,84 +145,39 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     }
   }
 
-  async function loadNavMesh(url: string) {
-    const gltf = await new GLTFLoader().loadAsync(url)
-
-    let nm: THREE.Mesh<THREE.BufferGeometry, THREE.Material | THREE.Material[]> | undefined
-    gltf.scene.traverse((o: any) => {
-      if (o.isMesh && (o.name === 'NavMesh' || o.userData?.navmesh)) {
-        nm = o as THREE.Mesh<THREE.BufferGeometry, THREE.Material | THREE.Material[]>
-      }
-    })
-    if (!nm) { console.warn('[NavMesh] No mesh named "NavMesh" found'); return }
-
-    // Bake world transform into cloned geometry
-    const geom = (nm.geometry as THREE.BufferGeometry).clone()
-    nm.updateWorldMatrix(true, true)
-    geom.applyMatrix4(nm.matrixWorld)
-
-    geom.applyMatrix4(modelXform) // navmesh needs same model xform as the scene
-    navRayMesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true, opacity: 1, transparent: true }))
-    scene.add(navRayMesh)
-    
-    // Pathfinding zone
-    const zone = Pathfinding.createZone(geom)
-    pathfinder.setZoneData(ZONE, zone)
-    navReady = true
-
-    // Hidden mesh to raycast *exactly* on navmesh
-    navRayMesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ visible: false }))
-    scene.add(navRayMesh)
-
-    console.log('[NavMesh] Zone ready + raycaster mesh')
-  }
-
   async function loadGLB(url: string) {
-    const hasExternalNav = !!cfg.navmeshUrl
-
     const loader = new GLTFLoader()
     const gltf = await loader.loadAsync(url)
-
     const root = gltf.scene as THREE.Object3D
     model = root
 
-    // Stop any GLB animations (e.g., turntable)
     if (gltf.animations?.length) {
       mixer = new THREE.AnimationMixer(root)
       gltf.animations.forEach((clip: THREE.AnimationClip) => {
         const action = mixer!.clipAction(clip)
-        action.stop()
-        action.enabled = false
+        action.stop(); action.enabled = false
       })
     }
 
-    // SpawnPoint pivot (Empty named "SpawnPoint")
-   // SpawnPoint pivot (Empty named "SpawnPoint")
-const spawn = root.getObjectByName('SpawnPoint')
-if (spawn) {
-  spawn.updateWorldMatrix(true, true)
-  const inv = new THREE.Matrix4().copy(spawn.matrixWorld).invert()
-  root.applyMatrix4(inv)
-  modelXform.copy(inv) // ⬅ record exactly what we applied to the model
-  console.log('[SpawnPoint] Found — aligned model to SpawnPoint.')
-} else {
-  console.warn('[SpawnPoint] Not found — using auto center/scale.')
-  // Compose a single transform: T(-center) → S(scale) → T(0, +1, 0)
-  const box = new THREE.Box3().setFromObject(root)
-  const size = new THREE.Vector3(); box.getSize(size)
-  const center = new THREE.Vector3(); box.getCenter(center)
-
-  const targetHeight = 1.5
-  const s = targetHeight / (size.y || 1.0)
-
-  const T1 = new THREE.Matrix4().makeTranslation(-center.x, -center.y, -center.z)
-  const S  = new THREE.Matrix4().makeScale(s, s, s)
-  const T2 = new THREE.Matrix4().makeTranslation(0, 1.0, 0)
-
-  modelXform.copy(T2).multiply(S).multiply(T1)
-  root.applyMatrix4(modelXform)
-}
-
+    // SpawnPoint alignment or fallback normalize
+    const spawn = root.getObjectByName('SpawnPoint')
+    if (spawn) {
+      spawn.updateWorldMatrix(true, true)
+      const inv = new THREE.Matrix4().copy(spawn.matrixWorld).invert()
+      root.applyMatrix4(inv)
+      modelXform.copy(inv)
+    } else {
+      const box = new THREE.Box3().setFromObject(root)
+      const size = new THREE.Vector3(); box.getSize(size)
+      const center = new THREE.Vector3(); box.getCenter(center)
+      const targetHeight = 1.5
+      const s = targetHeight / (size.y || 1.0)
+      const T1 = new THREE.Matrix4().makeTranslation(-center.x, -center.y, -center.z)
+      const S  = new THREE.Matrix4().makeScale(s, s, s)
+      const T2 = new THREE.Matrix4().makeTranslation(0, 1.0, 0)
+      modelXform.copy(T2).multiply(S).multiply(T1)
+      root.applyMatrix4(modelXform)
+    }
 
     root.traverse((o: any) => {
       if (o.isMesh) {
@@ -217,7 +185,6 @@ if (spawn) {
         o.receiveShadow = true
         if (o.material) o.material.envMapIntensity = 1.0
       }
-      // Optional: allow GLB floor meshes as teleport targets
       if (o.isMesh && (o.name?.toLowerCase?.().includes('floor') || o.userData?.teleportable)) {
         teleportables.push(o)
       }
@@ -226,104 +193,200 @@ if (spawn) {
     scene.add(root)
   }
 
-  // Load assets
- // Load assets
-if (cfg.hdriUrl) await loadHDRI(cfg.hdriUrl)
+  async function loadNavMesh(url: string) {
+    const gltf = await new GLTFLoader().loadAsync(url)
 
-  // 1) Load the model FIRST so modelXform is known
+    let nm: THREE.Mesh<THREE.BufferGeometry, THREE.Material | THREE.Material[]> | undefined
+    gltf.scene.traverse((o: any) => {
+      if (o.isMesh && (o.name === 'NavMesh' || o.userData?.navmesh)) nm = o
+    })
+    if (!nm) { console.warn('[NavMesh] No mesh named "NavMesh" found'); return }
+
+    const geom = (nm.geometry as THREE.BufferGeometry).clone()
+    nm.updateWorldMatrix(true, true)
+    geom.applyMatrix4(nm.matrixWorld)
+    geom.applyMatrix4(modelXform) // align with model transform
+
+    const zone = Pathfinding.createZone(geom)
+    pathfinder.setZoneData(ZONE, zone)
+    navReady = true
+
+    // hidden ray mesh for precise nav hits
+    navRayMesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ visible: false }))
+    scene.add(navRayMesh)
+  }
+
+  if (cfg.hdriUrl)  await loadHDRI(cfg.hdriUrl)
   if (cfg.modelUrl) {
     try { await loadGLB(cfg.modelUrl) }
     catch (e) {
       console.warn('[GLB] Failed to load model; showing fallback cube.', e)
-      const cube = new THREE.Mesh(
-        new THREE.BoxGeometry(1,1,1),
-        new THREE.MeshStandardMaterial({ metalness: 0.2, roughness: 0.5 })
-      )
+      const cube = new THREE.Mesh(new THREE.BoxGeometry(1,1,1),
+        new THREE.MeshStandardMaterial({ metalness: 0.2, roughness: 0.5 }))
       cube.position.y = 1.0
       scene.add(cube)
       model = cube
     }
   }
-  
-  // 2) Now load navmesh so it can apply modelXform correctly
   if (cfg.navmeshUrl) await loadNavMesh(cfg.navmeshUrl)
-  
 
-  // ===== Teleportation & movement =====
+  // --- Teleportation / movement ---
   const raycaster = new THREE.Raycaster()
-  const mouse = new THREE.Vector2()
-  const tmpMat = new THREE.Matrix4()
+  const clock = new THREE.Clock()
+  let path: THREE.Vector3[] = []
+  let pathIdx = 0
 
-  // click threshold (no move on drags)
+  // Drag/click guard
   const down = new THREE.Vector2()
   let downTime = 0
-  const CLICK_PX = 6
-  const CLICK_MS = 300
+  let dragging = false
 
   function planPath(to: THREE.Vector3) {
-    if (!navReady) { path = [to]; pathIdx = 0; return }
-    const start = rig.position.clone()
-    const groupID = pathfinder.getGroup(ZONE, start)
-    const navPath = pathfinder.findPath(start, to, ZONE, groupID)
-    path = navPath && navPath.length ? navPath : [to]
-    pathIdx = 0
+    const dest = to.clone()
+    // no pathfinding available → single segment
+    if (!navReady) { path = [dest]; pathIdx = 0; return }
+
+    try {
+      const start = rig.position.clone()
+      // @ts-ignore inspect internal zones for robustness
+      const zones = (pathfinder as any).zones || {}
+      if (!zones[ZONE]) throw new Error('No zone data')
+
+      const groupID = pathfinder.getGroup(ZONE, start)
+      if (groupID == null) throw new Error('No group for start')
+
+      const node = pathfinder.getClosestNode(dest, ZONE, groupID)
+      const clamped = node ? pathfinder.clampStep(start, dest, node, ZONE, groupID) : dest
+      const navPath = pathfinder.findPath(start, clamped, ZONE, groupID)
+
+      if (navPath && navPath.length) {
+        path = navPath.map(p => p.clone ? p.clone() : new THREE.Vector3(p.x, p.y, p.z))
+      } else {
+        path = [clamped.clone()]
+      }
+      pathIdx = 0
+    } catch {
+      path = [dest]
+      pathIdx = 0
+    }
+  }
+
+  function moveUserInstant(to: THREE.Vector3) {
+    if (renderer.xr.isPresenting) {
+      rig.position.set(to.x, 0, to.z)
+    } else {
+      // keep your current look; only move the body
+      rig.position.set(to.x, 0, to.z)
+    }
   }
 
   function startMove(to: THREE.Vector3, smooth: boolean) {
+    const dest = to.clone()
     if (renderer.xr.isPresenting && !smooth) {
-      // VR: instant teleport (comfort)
-      rig.position.set(to.x, 0, to.z)
-      controls.target.set(to.x, 1.2, to.z)
-      controls.update()
+      moveUserInstant(dest) // VR instant
       return
     }
-    // Desktop/mobile: plan path and let the loop lerp (preserves navmesh Y)
-    planPath(to)
+    planPath(dest)          // desktop/mobile smooth
   }
 
-  // Desktop aim marker — prefer the navmesh ray
-  renderer.domElement.addEventListener('pointermove', (e) => {
-    if (renderer.xr.isPresenting) return
-    const rect = renderer.domElement.getBoundingClientRect()
-    mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1
-    mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1
+  // --- Desktop first-person look (pointer lock) ---
+  function requestPointerLock() {
+    if (document.pointerLockElement !== renderer.domElement) {
+      renderer.domElement.requestPointerLock?.()
+    }
+  }
+  function exitPointerLock() {
+    if (document.pointerLockElement) document.exitPointerLock?.()
+  }
 
-    raycaster.setFromCamera(mouse, camera)
-    let hit: THREE.Intersection | undefined
-
-    if (navRayMesh) hit = raycaster.intersectObject(navRayMesh, false)[0]
-    else            hit = raycaster.intersectObjects(teleportables, true)[0]
-
-    if (hit) {
-      aimPoint.copy(hit.point)
-      marker.position.set(aimPoint.x, 0.01, aimPoint.z)
-      marker.visible = true
-    } else {
-      marker.visible = false
+  renderer.domElement.addEventListener('click', () => {
+    // Click to lock (common UX). If already locked, click is used for teleport below.
+    if (document.pointerLockElement !== renderer.domElement) {
+      requestPointerLock()
     }
   })
 
-  // Use click threshold (no move on drags)
+  document.addEventListener('pointerlockchange', () => {
+    // When unlocked, stop dragging state
+    if (document.pointerLockElement !== renderer.domElement) dragging = false
+  })
+
+  // Mouse look when locked
+  renderer.domElement.addEventListener('mousemove', (e) => {
+    if (renderer.xr.isPresenting) return
+    if (document.pointerLockElement === renderer.domElement) {
+      dragging = true
+      yaw.rotation.y -= e.movementX * LOOK_SENS_MOUSE
+      pitch.rotation.x -= e.movementY * LOOK_SENS_MOUSE
+      pitch.rotation.x = THREE.MathUtils.clamp(pitch.rotation.x, -LOOK_PITCH_LIMIT, LOOK_PITCH_LIMIT)
+    }
+  })
+
+  // Touch: one-finger drag to look
+  let lastTouchX = 0, lastTouchY = 0
+  renderer.domElement.addEventListener('touchstart', (e) => {
+    if (renderer.xr.isPresenting) return
+    const t = e.touches[0]
+    lastTouchX = t.clientX; lastTouchY = t.clientY
+    down.set(t.clientX, t.clientY)
+    downTime = performance.now()
+    dragging = false
+  }, { passive: true })
+
+  renderer.domElement.addEventListener('touchmove', (e) => {
+    if (renderer.xr.isPresenting) return
+    const t = e.touches[0]
+    const dx = t.clientX - lastTouchX
+    const dy = t.clientY - lastTouchY
+    lastTouchX = t.clientX; lastTouchY = t.clientY
+
+    // treat as look
+    yaw.rotation.y -= dx * LOOK_SENS_TOUCH
+    pitch.rotation.x -= dy * LOOK_SENS_TOUCH
+    pitch.rotation.x = THREE.MathUtils.clamp(pitch.rotation.x, -LOOK_PITCH_LIMIT, LOOK_PITCH_LIMIT)
+
+    dragging = true
+  }, { passive: true })
+
+  renderer.domElement.addEventListener('touchend', (e) => {
+    if (renderer.xr.isPresenting) return
+    const dt = performance.now() - downTime
+    const isClick = !dragging && dt <= CLICK_MS
+    if (isClick && marker.visible) startMove(aimPoint, true)
+    dragging = false
+  })
+
+  // Mouse click teleport (when already locked, or short click with minimal movement)
   renderer.domElement.addEventListener('pointerdown', (e) => {
     if (renderer.xr.isPresenting) return
     down.set(e.clientX, e.clientY)
     downTime = performance.now()
+    dragging = false
   })
   renderer.domElement.addEventListener('pointerup', (e) => {
     if (renderer.xr.isPresenting) return
     const dx = e.clientX - down.x
     const dy = e.clientY - down.y
     const dt = performance.now() - downTime
-    const isClick = (dx*dx + dy*dy) <= (CLICK_PX*CLICK_PX) && dt <= CLICK_MS
-    if (isClick && marker.visible) startMove(aimPoint, true)
+    const moved = (dx*dx + dy*dy) > (CLICK_PX*CLICK_PX)
+    const isClick = !moved && dt <= CLICK_MS
+
+    // If not locked yet, first click locks; second click (locked) teleports
+    const locked = document.pointerLockElement === renderer.domElement
+    if (!locked) {
+      // first click just requests lock; ignore teleport
+      requestPointerLock()
+    } else if (isClick && marker.visible) {
+      startMove(aimPoint, true)
+    }
   })
 
-  // XR controllers
+  // --- XR controllers (ray to teleport) ---
+  const tmpMat = new THREE.Matrix4()
   function addController(index: number) {
     const ctrl = renderer.xr.getController(index)
     rig.add(ctrl)
 
-    // Visible ray from controller
     const rayGeom = new THREE.BufferGeometry().setFromPoints([
       new THREE.Vector3(0, 0, 0),
       new THREE.Vector3(0, 0, -1)
@@ -336,17 +399,26 @@ if (cfg.hdriUrl) await loadHDRI(cfg.hdriUrl)
       if (marker.visible) startMove(aimPoint, false) // instant in VR
     })
 
-    // Update marker each frame from controller aim — prefer navmesh ray
     ctrl.userData.updateAim = () => {
       tmpMat.identity().extractRotation(ctrl.matrixWorld)
       raycaster.ray.origin.setFromMatrixPosition(ctrl.matrixWorld)
       raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpMat)
-      let hit: THREE.Intersection | undefined
-      if (navRayMesh) hit = raycaster.intersectObject(navRayMesh, false)[0]
-      else            hit = raycaster.intersectObjects(teleportables, true)[0]
+
+      let hit = navRayMesh ? raycaster.intersectObject(navRayMesh, false)[0] : undefined
+      if (!hit) hit = raycaster.intersectObjects(teleportables, true)[0]
+
       if (hit) {
         aimPoint.copy(hit.point)
-        marker.position.set(aimPoint.x, 0.01, aimPoint.z)
+        if (hit.face && hit.object) {
+          _mat3.getNormalMatrix((hit.object as THREE.Object3D).matrixWorld)
+          _normal.copy(hit.face.normal).applyMatrix3(_mat3).normalize()
+          _quat.setFromUnitVectors(new THREE.Vector3(0, 1, 0), _normal)
+          marker.quaternion.copy(_quat)
+        } else {
+          _normal.set(0, 1, 0)
+          marker.quaternion.set(0,0,0,1)
+        }
+        marker.position.copy(aimPoint).addScaledVector(_normal, 0.01)
         marker.visible = true
       } else {
         marker.visible = false
@@ -356,7 +428,23 @@ if (cfg.hdriUrl) await loadHDRI(cfg.hdriUrl)
   addController(0)
   addController(1)
 
-  // ===== Animate =====
+  // --- XR camera parenting / unparenting ---
+  renderer.xr.addEventListener('sessionstart', () => {
+    // In XR: camera should be under the rig so rig translation teleports user
+    if (camera.parent !== pitch) {
+      // existing hierarchy is pitch -> camera; in XR, platform replaces camera pose
+      // just ensure the chain exists (it does)
+    }
+    // zero rig rotations/scales for stability
+    rig.rotation.set(0,0,0)
+    rig.scale.set(1,1,1)
+  })
+
+  renderer.xr.addEventListener('sessionend', () => {
+    // nothing special; desktop uses our yaw/pitch anyway
+  })
+
+  // --- Resize ---
   const onResize = () => {
     const w = mount.clientWidth, h = mount.clientHeight
     renderer.setSize(w, h)
@@ -365,56 +453,80 @@ if (cfg.hdriUrl) await loadHDRI(cfg.hdriUrl)
   }
   window.addEventListener('resize', onResize)
 
+  // --- Animate ---
   renderer.setAnimationLoop(() => {
-    // Smooth locomotion (desktop/mobile)
-    if (path.length) {
-      const dt = Math.min(0.05, clock.getDelta())
-      const target = path[pathIdx]
-      const toTarget = target.clone().sub(rig.position)
-      const dist = toTarget.length()
-      const step = MOVE_SPEED * dt
+    const dt = Math.min(0.05, clock.getDelta())
 
-      if (dist <= Math.max(0.02, step)) {
-        rig.position.copy(target) // snap to waypoint (includes navmesh Y)
-        pathIdx++
-        if (pathIdx >= path.length) path = []
+    // Desktop/Mobile center‑reticle aim (ray from camera forward)
+    if (!renderer.xr.isPresenting) {
+      _dir.set(0, 0, -1).applyQuaternion(camera.quaternion).normalize()
+      raycaster.set(camera.getWorldPosition(_tmpV), _dir)
+      let hit = navRayMesh ? raycaster.intersectObject(navRayMesh, false)[0] : undefined
+      if (!hit) hit = raycaster.intersectObjects(teleportables, true)[0]
+
+      if (hit) {
+        aimPoint.copy(hit.point)
+        if (hit.face && hit.object) {
+          _mat3.getNormalMatrix((hit.object as THREE.Object3D).matrixWorld)
+          _normal.copy(hit.face.normal).applyMatrix3(_mat3).normalize()
+          _quat.setFromUnitVectors(new THREE.Vector3(0, 1, 0), _normal)
+          marker.quaternion.copy(_quat)
+        } else {
+          _normal.set(0, 1, 0)
+          marker.quaternion.set(0,0,0,1)
+        }
+        marker.position.copy(aimPoint).addScaledVector(_normal, 0.01)
+        marker.visible = true
       } else {
-        toTarget.normalize().multiplyScalar(step)
-        rig.position.add(toTarget)
+        marker.visible = false
       }
-      controls.target.set(rig.position.x, 1.2, rig.position.z)
-      controls.update()
-    }
-
-    // Update controller aim marker in XR
-    if (renderer.xr.isPresenting) {
+    } else {
+      // update XR controller aim reticle
       const c0 = renderer.xr.getController(0)
       const c1 = renderer.xr.getController(1)
       c0?.userData?.updateAim?.()
       c1?.userData?.updateAim?.()
     }
 
-    // Subtle marker pulse
+    // Smooth locomotion (desktop/mobile)
+    if (path.length) {
+      const target = path[pathIdx]
+      const current = rig.position
+      _tmpV.copy(target).sub(current)
+      const dist = _tmpV.length()
+      const step = MOVE_SPEED * dt
+      const tol  = Math.max(0.05, step)
+
+      if (dist <= tol) {
+        rig.position.set(target.x, 0, target.z)
+        pathIdx++
+        if (pathIdx >= path.length) path = []
+      } else {
+        _tmpV.normalize().multiplyScalar(step)
+        rig.position.add(_tmpV.set(_tmpV.x, 0, _tmpV.z)) // keep y=0
+      }
+    }
+
+    // subtle marker pulse
     if (marker.visible) {
       const s = 1 + 0.05 * Math.sin(performance.now() * 0.006)
       marker.scale.set(s, 1, s)
     }
 
-    if (!renderer.xr.isPresenting) controls.update()
     renderer.render(scene, camera)
   })
 
   return {
-    renderer, scene, camera, controls, model, mount,
+    renderer, scene, camera, rig, model, mount,
     toggleBackground: () => {
       if (!envMap) return
       scene.background = scene.background ? null : envMap
     },
-    resetCamera: () => {
-      rig.position.set(0, 0, 0)
-      camera.position.set(0, 1.6, 2.5)
-      controls.target.set(0, 1.2, 0)
-      controls.update()
+    resetView: () => {
+      path = []
+      rig.position.set(0, 0, 2.5)
+      yaw.rotation.set(0, 0, 0)
+      pitch.rotation.set(0, 0, 0)
     }
   }
 }
