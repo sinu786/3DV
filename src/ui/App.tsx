@@ -13,6 +13,7 @@ export default function App() {
       if (!mountRef.current) return
       try {
         const h = await initViewer(mountRef.current, {
+          navmeshUrl: '/assets/navmesh.glb',
           modelUrl: '/assets/model.glb',
           hdriUrl: '/assets/studio_small_03_1k.hdr',
           showHDRIBackground: true
