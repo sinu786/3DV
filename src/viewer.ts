@@ -6,6 +6,10 @@ import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader'
 import { Pathfinding } from 'three-pathfinding'
 
+const _normal = new THREE.Vector3()
+const _quat = new THREE.Quaternion()
+const _mat3 = new THREE.Matrix3()
+
 // derive the instance type from the class
 type Controls = InstanceType<typeof OrbitControlsImpl>
 
@@ -71,7 +75,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   groundMat.colorWrite = false
   groundMat.side = THREE.DoubleSide
 
-  const ground = new THREE.Mesh(new THREE.PlaneGeometry(200, 200).rotateX(-Math.PI / 2), groundMat)
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(200, 200).rotateZ(-Math.PI / 2), groundMat)
   ground.position.y = 0
   ground.name = 'TeleportGround'
   ;(ground as any).userData.teleportable = true
@@ -96,14 +100,14 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
 
   const aimPoint = new THREE.Vector3()
   const marker = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.18, 0.22, 0.02, 28, 1, true),
-    new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.35 })
+    new THREE.RingGeometry(0.15, 0.22, 40, 1),   // cleaner reticle
+    new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.6, side: THREE.DoubleSide })
   )
-  marker.rotation.x = -Math.PI / 2
   ;(marker.material as THREE.MeshBasicMaterial).depthTest = false
   marker.renderOrder = 999
   marker.visible = false
   scene.add(marker)
+  
 
   // Smooth locomotion (desktop/mobile)
   let path: THREE.Vector3[] = []
@@ -223,18 +227,27 @@ if (spawn) {
   }
 
   // Load assets
-  if (cfg.hdriUrl) await loadHDRI(cfg.hdriUrl)
-  if (cfg.navmeshUrl) await loadNavMesh(cfg.navmeshUrl)
+ // Load assets
+if (cfg.hdriUrl) await loadHDRI(cfg.hdriUrl)
+
+  // 1) Load the model FIRST so modelXform is known
   if (cfg.modelUrl) {
     try { await loadGLB(cfg.modelUrl) }
     catch (e) {
       console.warn('[GLB] Failed to load model; showing fallback cube.', e)
-      const cube = new THREE.Mesh(new THREE.BoxGeometry(1,1,1), new THREE.MeshStandardMaterial({ metalness: 0.2, roughness: 0.5 }))
+      const cube = new THREE.Mesh(
+        new THREE.BoxGeometry(1,1,1),
+        new THREE.MeshStandardMaterial({ metalness: 0.2, roughness: 0.5 })
+      )
       cube.position.y = 1.0
       scene.add(cube)
       model = cube
     }
   }
+  
+  // 2) Now load navmesh so it can apply modelXform correctly
+  if (cfg.navmeshUrl) await loadNavMesh(cfg.navmeshUrl)
+  
 
   // ===== Teleportation & movement =====
   const raycaster = new THREE.Raycaster()
