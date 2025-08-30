@@ -18,6 +18,7 @@ export default function App() {
           hdriUrl: '/assets/studio_small_03_1k.hdr',
           showHDRIBackground: true,
           initialModelScale: scale, // start with UI scale
+          navmeshUrl: '/assets/navmesh.glb', // <- teleport only on this mesh
         })
         setHandle(h)
         setStatus('Ready')
@@ -52,6 +53,7 @@ export default function App() {
           fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
           backdropFilter: 'blur(6px)',
           maxWidth: 360,
+          pointerEvents: 'auto',
         }}
       >
         <div style={{ fontWeight: 700, marginBottom: 4 }}>WebXR Starter</div>
@@ -92,7 +94,8 @@ export default function App() {
           />
           <div style={{ marginTop: 6, fontSize: 12, opacity: 0.85, lineHeight: 1.35 }}>
             • Drag to look · Click to move<br />
-            • VR/AR: use controller trigger to move
+            • VR/AR: use controller trigger to move<br />
+            • Debug: press <kbd>N</kbd> to toggle navmesh wireframe
           </div>
         </div>
       </div>
@@ -110,6 +113,7 @@ export default function App() {
           borderRadius: 6,
           fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
           fontSize: 12,
+          pointerEvents: 'auto',
         }}
       >
         VR • AR • Desktop • Mobile — Three.js
