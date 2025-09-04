@@ -5,8 +5,48 @@ import { ARButton } from 'three/examples/jsm/webxr/ARButton'
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader'
 
+// Postprocessing (runtime-only; avoid using them as TS types)
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer'
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass'
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass'
+import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass'
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass'
+
+// --- custom vignette shader (fade-to-black overlay; no “negative” blending)
+const VignetteOverlay = {
+  uniforms: {
+    tDiffuse: { value: null },
+    offset:   { value: 1.0 }, // inner radius start (0–2)
+    darkness: { value: 1.2 }, // strength (0–3)
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    uniform float offset;
+    uniform float darkness;
+    varying vec2 vUv;
+    void main() {
+      vec4 color = texture2D( tDiffuse, vUv );
+      float d = distance(vUv, vec2(0.5));
+      // soft radial mask from center to corners
+      float v = smoothstep(offset, offset + 0.5, d);
+      // fade to black (no negative/multiply artifacts)
+      color.rgb = mix(color.rgb, vec3(0.0), v * darkness);
+      gl_FragColor = color;
+    }
+  `
+}
+
 // ---- constants
-const DEFAULT_EYE_HEIGHT = 1
+// Note: 0.002m is 2mm; typical human eye height is ~1.6m.
+const DEFAULT_EYE_HEIGHT = 0.2
+
 const LOOK_SENS_MOUSE = 0.0022
 const LOOK_SENS_TOUCH = 0.005
 const LOOK_PITCH_LIMIT = THREE.MathUtils.degToRad(85)
@@ -24,12 +64,12 @@ const PINCH_ZOOM_SNAP = true
 // ---- temps
 const _tmpV = new THREE.Vector3()
 const _mouseNDC = new THREE.Vector2(0, 0)
+const _ray = new THREE.Ray()
 
 // Fallback floor helpers (only used if NO navmesh provided)
 const _floorPlane = new THREE.Plane()
 const _floorPosWS = new THREE.Vector3()
 const _floorNormalWS = new THREE.Vector3(0, 1, 0)
-const _ray = new THREE.Ray()
 
 // --- navmesh state
 let navmeshGroup: THREE.Group | null = null        // holds baked navmesh meshes (always visible for raycast)
@@ -41,11 +81,16 @@ const _modelAppliedXform = new THREE.Matrix4().identity()
 
 export type ViewerConfig = {
   modelUrl?: string
+  hdriintesity?: number
   hdriUrl?: string
   showHDRIBackground?: boolean
   initialModelScale?: number
   initialEyeHeight?: number
   navmeshUrl?: string // teleport only on this imported mesh
+
+  // Lightmap (supports HDR .hdr atlases)
+  lightmapUrl?: string
+  lightmapIntensity?: number
 }
 
 export type ViewerHandle = {
@@ -74,7 +119,13 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   renderer.setClearColor(0x0f1116, 1)
   renderer.outputColorSpace = THREE.SRGBColorSpace
   renderer.toneMapping = THREE.ACESFilmicToneMapping
-  renderer.toneMappingExposure = 1.0
+  renderer.toneMappingExposure = 1.1 // slight lift pairs nicely with bloom
+
+  // Soft shadows
+  renderer.shadowMap.enabled = true
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap
+
+  // WebXR
   renderer.xr.enabled = true
   try { renderer.xr.setReferenceSpaceType?.('local-floor') } catch {}
   mount.appendChild(renderer.domElement)
@@ -84,12 +135,12 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   // VR/AR buttons (never throw)
   try {
     const vrBtn = VRButton.createButton(renderer)
-    Object.assign(vrBtn.style, { position: 'fixed', right: '12px', bottom: '12px' })
+    Object.assign(vrBtn.style, { position: 'fixed', right: '12px', bottom: '12px' } as Partial<CSSStyleDeclaration>)
     safeAppend(document.body, vrBtn)
   } catch (e) { console.warn('[viewer] VRButton failed', e) }
   try {
     const arBtn = ARButton.createButton(renderer, { requiredFeatures: [] })
-    Object.assign(arBtn.style, { position: 'fixed', right: '12px', bottom: '56px' })
+    Object.assign(arBtn.style, { position: 'fixed', right: '12px', bottom: '56px' } as Partial<CSSStyleDeclaration>)
     safeAppend(document.body, arBtn)
   } catch (e) { console.warn('[viewer] ARButton failed', e) }
 
@@ -104,6 +155,41 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   let targetFov = FOV_MAX // start at widest
   camera.fov = targetFov
   camera.updateProjectionMatrix()
+
+  // --- postprocessing
+  // IMPORTANT: do NOT use imported classes as TS types here (no .d.ts). Use `any`.
+  let composer: any = null
+  let renderPass: any
+  let bloomPass: any
+  let vignettePass: any
+
+  function buildComposer() {
+    const pr = Math.min(window.devicePixelRatio, 2)
+    const w = Math.max(1, mount.clientWidth)
+    const h = Math.max(1, mount.clientHeight)
+
+    composer = new EffectComposer(renderer)
+    composer.setPixelRatio(pr)   // DPR goes here
+    composer.setSize(w, h)       // CSS pixels here
+
+    renderPass = new RenderPass(scene, camera)
+    composer.addPass(renderPass)
+
+    // Bloom at CSS pixel size (NOT multiplied by DPR) – avoids “patchy” regions
+    bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.22, 0.55, 0.85)
+    composer.addPass(bloomPass)
+
+    // Vignette (fade-to-black overlay; avoids “negative blend” look)
+    vignettePass = new ShaderPass(VignetteOverlay as any)
+    vignettePass.uniforms['offset'].value = 1.0
+    vignettePass.uniforms['darkness'].value = 1.2
+    composer.addPass(vignettePass)
+
+    // Output pass ensures proper tonemapping/color space & avoids artifacts
+    const outputPass = new OutputPass()
+    composer.addPass(outputPass)
+  }
+  buildComposer()
 
   // first-person rig (yaw/pitch)
   const rig = new THREE.Group(); rig.name = 'Rig'
@@ -120,11 +206,24 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   scene.add(world)
 
   // lighting
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x404040, 0.6))
-  const dir = new THREE.DirectionalLight(0xffffff, 0.7)
-  dir.position.set(5, 10, 5)
-  dir.castShadow = false
-  scene.add(dir)
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x404040, 0.55)
+  scene.add(hemi)
+
+  const sun = new THREE.DirectionalLight(0xffffff, 2.2)
+  sun.position.set(5, 10, 4)
+  sun.castShadow = true
+  // shadow quality & bounds
+  const res = 2048
+  sun.shadow.mapSize.set(res, res)
+  sun.shadow.radius = 2
+  sun.shadow.bias = -0.00015
+  sun.shadow.camera.near = 0.1
+  sun.shadow.camera.far = 50
+  sun.shadow.camera.left = -15
+  sun.shadow.camera.right = 15
+  sun.shadow.camera.top = 15
+  sun.shadow.camera.bottom = -15
+  scene.add(sun)
 
   // PMREM/HDRI
   const pmrem = new THREE.PMREMGenerator(renderer)
@@ -141,16 +240,39 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     } catch (e) { console.warn('[viewer] HDRI load failed (continuing)', e) }
   }
 
+  // Lightmap loader (HDR or LDR)
+  async function loadLightmapTexture(url: string): Promise<THREE.Texture> {
+    const isHDR = /\.hdr$/i.test(url)
+    let tex: THREE.Texture
+    if (isHDR) {
+      tex = await new RGBELoader().loadAsync(url) // linear HDR
+      tex.generateMipmaps = false
+      tex.minFilter = THREE.LinearFilter
+      tex.magFilter = THREE.LinearFilter
+    } else {
+      tex = await new THREE.TextureLoader().loadAsync(url) // likely LDR (linear assumed)
+      const maxAniso = (renderer.capabilities as any).getMaxAnisotropy?.() ?? 1
+      tex.anisotropy = maxAniso
+      // If your LDR lightmap is authored in sRGB, uncomment:
+      // ;(tex as any).colorSpace = THREE.SRGBColorSpace
+    }
+    tex.wrapS = THREE.ClampToEdgeWrapping
+    tex.wrapT = THREE.ClampToEdgeWrapping
+    tex.flipY = false
+    return tex
+  }
+
   // ---- fallback floor (used only if no navmesh)
   let navFloor: THREE.Mesh<THREE.PlaneGeometry, THREE.Material> | null = null
   function ensureNavFloor() {
     if (navFloor) return
     const mat = new THREE.MeshStandardMaterial({ transparent: true, opacity: 0, side: THREE.DoubleSide })
     mat.depthWrite = false
-    mat.colorWrite = false
+    ;(mat as any).colorWrite = false
     const geom = new THREE.PlaneGeometry(200, 200).rotateX(-Math.PI / 2)
     navFloor = new THREE.Mesh(geom, mat)
     navFloor.name = 'TeleportFloor'
+    navFloor.receiveShadow = true
     world.add(navFloor)
   }
   function stickNavFloorToMinY() {
@@ -175,6 +297,34 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   let model: THREE.Object3D | undefined
   let modelXform = new THREE.Matrix4().identity()
 
+  // Strict lightmap applier: requires uv2/TEXCOORD_1 present
+  function applyLightmapToRoot(root: THREE.Object3D, lm: THREE.Texture, lmIntensity: number) {
+    let applied = 0, missing = 0
+    root.traverse((o) => {
+      const mesh = o as THREE.Mesh<THREE.BufferGeometry, THREE.Material | THREE.Material[]>
+      if (!(mesh as any).isMesh || !mesh.geometry || !mesh.material) return
+
+      const geo = mesh.geometry
+      const uv2 = geo.getAttribute('uv2')
+      if (!uv2) { missing++; return } // skip — exporter must provide TEXCOORD_1
+
+      const apply = (mat: THREE.Material) => {
+        const std = mat as THREE.MeshStandardMaterial
+        if (!(std as any).isMeshStandardMaterial && !(std as any).isMeshPhysicalMaterial) return
+        std.lightMap = lm
+        std.lightMapIntensity = lmIntensity
+        std.dithering = true
+        std.needsUpdate = true
+        applied++
+      }
+      Array.isArray(mesh.material) ? mesh.material.forEach(apply) : apply(mesh.material)
+    })
+    if (missing) {
+      console.warn(`[viewer] lightmap skipped on ${missing} mesh(es) with no uv2. Ensure GLB exports TEXCOORD_1.`)
+    }
+    console.log(`[viewer] lightmap applied on ${applied} mesh(es) using uv2`)
+  }
+
   async function loadGLB(url: string) {
     const gltf = await new GLTFLoader().loadAsync(url)
     const root = gltf.scene as THREE.Object3D
@@ -187,7 +337,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       const inv = new THREE.Matrix4().copy(spawn.matrixWorld).invert()
       root.applyMatrix4(inv)
       modelXform.copy(inv)
-      _modelAppliedXform.copy(inv) // << remember model transform
+      _modelAppliedXform.copy(inv) // remember model transform
     } else {
       // Auto center/scale
       const box = new THREE.Box3().setFromObject(root)
@@ -200,12 +350,37 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       const T2 = new THREE.Matrix4().makeTranslation(0, 1.0, 0)
       modelXform.copy(T2).multiply(S).multiply(T1)
       root.applyMatrix4(modelXform)
-      _modelAppliedXform.copy(modelXform) // << remember model transform
+      _modelAppliedXform.copy(modelXform)
     }
+
+    // Shadows + dithering
+    root.traverse((o) => {
+      const m = o as THREE.Mesh
+      if ((m as any).isMesh) { m.castShadow = true; m.receiveShadow = true }
+      const mat = (o as any).material
+      const set = (mm: THREE.Material) => {
+        const std = mm as THREE.MeshStandardMaterial
+        if ((std as any).isMeshStandardMaterial || (std as any).isMeshPhysicalMaterial) {
+          std.dithering = true
+        }
+      }
+      if (Array.isArray(mat)) mat.forEach(set); else if (mat) set(mat)
+    })
 
     world.add(root)
     ensureNavFloor()
     stickNavFloorToMinY()
+
+    // Apply baked lightmap strictly (requires uv2)
+    if (cfg.lightmapUrl) {
+      try {
+        const lm = await loadLightmapTexture(cfg.lightmapUrl)
+        const lmIntensity = cfg.lightmapIntensity ?? 1.0
+        applyLightmapToRoot(root, lm, lmIntensity)
+      } catch (err) {
+        console.warn('[viewer] lightmap load/apply failed', err)
+      }
+    }
   }
 
   // NAVMESH loader (supports many child meshes). Keeps meshes VISIBLE for raycast, but non-rendering.
@@ -225,7 +400,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
           // Bake world transform AND the model's applied transform (so both align!)
           const baked = m.geometry.clone()
           baked.applyMatrix4(m.matrixWorld)
-          baked.applyMatrix4(_modelAppliedXform) // << align to model transform
+          baked.applyMatrix4(_modelAppliedXform)
           baked.deleteAttribute('normal')
           baked.deleteAttribute('uv')
           baked.computeBoundingBox()
@@ -237,7 +412,6 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
             transparent: true,
             opacity: 0.0,           // invisible by default
           })
-          // make it non-rendering but raycastable
           ;(mat as any).colorWrite = false
           ;(mat as any).depthWrite = false
 
@@ -292,6 +466,8 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
         new THREE.MeshStandardMaterial({ metalness: 0.2, roughness: 0.5 })
       )
       cube.position.y = 1.0
+      cube.castShadow = true
+      cube.receiveShadow = true
       world.add(cube)
       model = cube
       _modelAppliedXform.identity() // fallback: no special transform
@@ -302,6 +478,8 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       new THREE.MeshStandardMaterial({ metalness: 0.2, roughness: 0.5 })
     )
     cube.position.y = 1.0
+    cube.castShadow = true
+    cube.receiveShadow = true
     world.add(cube)
     model = cube
     _modelAppliedXform.identity()
@@ -337,7 +515,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   scene.add(marker)
 
   // --- standing indicator (glow sprite + subtle point light)
-  const standLight = new THREE.PointLight(0xffaa66, 0.9, 3.0, 2.0)
+  const standLight = new THREE.PointLight(0xffaa66, 0.01, 5.0, 2.0)
   standLight.position.set(0, 0.1, 0)
   scene.add(standLight)
 
@@ -407,7 +585,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     const moved = (dx*dx + dy*dy) > (CLICK_PX*CLICK_PX)
     if (!moved && dtUp <= CLICK_MS && marker.visible) {
       moveTo(aimPoint, true)
-      standLight.intensity = 1.6
+      standLight.intensity = 0.5
     }
     isDragging = false
     dragging = false
@@ -460,7 +638,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   renderer.domElement.addEventListener('touchmove', (e) => {
     if (renderer.xr.isPresenting) return
 
-    if (e.touches.length >= 2 && pinchActive && PINCH_ZOOM_SNAP) {
+    if (e.touches.length >= 2 && PINCH_ZOOM_SNAP) {
       const a = e.touches[0], b = e.touches[1]
       const d = dist2D(a.clientX, a.clientY, b.clientX, b.clientY)
       if (!pinchSnapChosen) {
@@ -542,11 +720,22 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   function doResize() {
     const w = Math.max(1, mount.clientWidth)
     const h = Math.max(1, mount.clientHeight)
+
     renderer.setSize(w, h)
     camera.aspect = w / h
     camera.updateProjectionMatrix()
     stickNavFloorToMinY()
+
+    if (composer) {
+      const pr = Math.min(window.devicePixelRatio, 2)
+      composer.setPixelRatio(pr)
+      composer.setSize(w, h)
+      if (bloomPass && typeof bloomPass.setSize === 'function') {
+        bloomPass.setSize(w, h)   // <- important: CSS pixels
+      }
+    }
   }
+
   window.addEventListener('resize', doResize)
 
   // helpers
@@ -554,7 +743,6 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     if (hit && navmeshGroup) {
       aimPoint.copy(hit.point)
       marker.quaternion.set(0, 0, 0, 1)
-      // ⬇️ show marker exactly where you’re aiming (local surface height)
       const y = hit.point.y + 0.01
       marker.position.set(aimPoint.x, y, aimPoint.z)
       marker.visible = true
@@ -568,14 +756,12 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       marker.visible = false
     }
   }
-  
 
   function moveTo(target: THREE.Vector3, smooth: boolean) {
     const dest = target.clone()
-    // ⬇️ still clamp to lowest Y on the navmesh
     const y = navmeshGroup ? (navmeshMinY ?? target.y) : (navFloor ? _floorPosWS.y : 0)
     dest.y = y
-  
+
     if (!smooth || renderer.xr.isPresenting) {
       rig.position.set(dest.x, 0, dest.z)
       moveTarget = null
@@ -583,15 +769,15 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       moveTarget = dest
     }
   }
-  
 
-  // --- UI: FOV toggle buttons (18° / 35°)
+  // --- UI: FOV toggle buttons (18° / 35°) + Bloom controls
   let activePreset: 18 | 35 | null = null
   const ui = document.createElement('div')
   ui.style.position = 'fixed'
   ui.style.top = '12px'
   ui.style.right = '12px'
   ui.style.display = 'flex'
+  ui.style.flexDirection = 'column'
   ui.style.gap = '8px'
   ui.style.zIndex = '1000'
   const mkBtn = (label: string) => {
@@ -613,7 +799,13 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
 
   const btn18 = mkBtn('18°')
   const btn35 = mkBtn('35°')
-  ui.append(btn18, btn35)
+
+  const fovRow = document.createElement('div')
+  fovRow.style.display = 'flex'
+  fovRow.style.gap = '8px'
+  fovRow.append(btn18, btn35)
+
+  ui.append(fovRow)
   safeAppend(document.body, ui)
 
   function updateBtnStates() {
@@ -641,6 +833,179 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     setFovPresetInternal(activePreset === 35 ? null : 35)
   })
   updateBtnStates()
+
+  // --- Bloom controls (enable + strength + radius + threshold)
+  const bloomWrap = document.createElement('div')
+  bloomWrap.style.display = 'grid'
+  bloomWrap.style.gridTemplateColumns = 'auto 1fr 48px'
+  bloomWrap.style.alignItems = 'center'
+  bloomWrap.style.gap = '8px'
+  bloomWrap.style.background = '#0b1220'
+  bloomWrap.style.border = '1px solid #1f2a44'
+  bloomWrap.style.border = '1px solid #1f2a44'
+  bloomWrap.style.borderRadius = '10px'
+  bloomWrap.style.padding = '8px 10px'
+
+  const bloomEnable = document.createElement('input')
+  bloomEnable.type = 'checkbox'
+  bloomEnable.checked = true
+  bloomEnable.style.marginRight = '6px'
+
+  const bloomLabel = document.createElement('label')
+  bloomLabel.style.color = '#bfdbfe'
+  bloomLabel.style.font = '12px/1.2 system-ui,-apple-system,Segoe UI,Inter,Roboto,sans-serif'
+  bloomLabel.append(bloomEnable, document.createTextNode('Bloom'))
+
+  const bloomStrength = document.createElement('input')
+  bloomStrength.type = 'range'
+  bloomStrength.min = '0'
+  bloomStrength.max = '2'
+  bloomStrength.step = '0.01'
+  bloomStrength.value = '0.22'
+  bloomStrength.style.width = '160px'
+  bloomStrength.style.accentColor = '#60a5fa'
+
+  const bloomStrengthVal = document.createElement('span')
+  bloomStrengthVal.textContent = `${Number(bloomStrength.value).toFixed(2)}`
+  bloomStrengthVal.style.color = '#e5e7eb'
+  bloomStrengthVal.style.font = '12px/1.2 system-ui,-apple-system,Segoe UI,Inter,Roboto,sans-serif'
+  bloomStrengthVal.style.textAlign = 'right'
+
+  bloomEnable.addEventListener('change', () => { if (bloomPass) bloomPass.enabled = bloomEnable.checked })
+  bloomStrength.addEventListener('input', () => {
+    const v = Number(bloomStrength.value)
+    if (bloomPass) bloomPass.strength = v
+    bloomStrengthVal.textContent = v.toFixed(2)
+  })
+
+  bloomWrap.append(bloomLabel, bloomStrength, bloomStrengthVal)
+  ui.append(bloomWrap)
+
+  // Radius control
+  const radiusWrap = document.createElement('div')
+  Object.assign(radiusWrap.style, {
+    display: 'grid',
+    gridTemplateColumns: 'auto 1fr 48px',
+    alignItems: 'center',
+    gap: '8px',
+    background: '#0b1220',
+    border: '1px solid #1f2a44',
+    borderRadius: '10px',
+    padding: '8px 10px'
+  } as Partial<CSSStyleDeclaration>)
+  const radiusLabel = document.createElement('label'); radiusLabel.textContent = 'Bloom Radius'; radiusLabel.style.color = '#bfdbfe'; radiusLabel.style.font = '12px/1.2 system-ui'
+  const radiusSlider = document.createElement('input')
+  radiusSlider.type = 'range'; radiusSlider.min = '0'; radiusSlider.max = '1.5'; radiusSlider.step = '0.01'; radiusSlider.value = '0.55'
+  radiusSlider.style.width = '160px'; radiusSlider.style.accentColor = '#60a5fa'
+  const radiusVal = document.createElement('span'); radiusVal.textContent = '0.55'; radiusVal.style.color = '#e5e7eb'; radiusVal.style.font = '12px/1.2 system-ui'; radiusVal.style.textAlign = 'right'
+  radiusSlider.addEventListener('input', () => { const v = Number(radiusSlider.value); if (bloomPass) bloomPass.radius = v; radiusVal.textContent = v.toFixed(2) })
+  radiusWrap.append(radiusLabel, radiusSlider, radiusVal)
+  ui.append(radiusWrap)
+
+  // Threshold control
+  const thWrap = document.createElement('div')
+  Object.assign(thWrap.style, {
+    display: 'grid',
+    gridTemplateColumns: 'auto 1fr 48px',
+    alignItems: 'center',
+    gap: '8px',
+    background: '#0b1220',
+    border: '1px solid #1f2a44',
+    borderRadius: '10px',
+    padding: '8px 10px'
+  } as Partial<CSSStyleDeclaration>)
+  const thLabel = document.createElement('label'); thLabel.textContent = 'Bloom Threshold'; thLabel.style.color = '#bfdbfe'; thLabel.style.font = '12px/1.2 system-ui'
+  const thSlider = document.createElement('input')
+  thSlider.type = 'range'; thSlider.min = '0'; thSlider.max = '1'; thSlider.step = '0.001'; thSlider.value = '0.85'
+  thSlider.style.width = '160px'; thSlider.style.accentColor = '#60a5fa'
+  const thVal = document.createElement('span'); thVal.textContent = '0.85'; thVal.style.color = '#e5e7eb'; thVal.style.font = '12px/1.2 system-ui'; thVal.style.textAlign = 'right'
+  thSlider.addEventListener('input', () => { const v = Number(thSlider.value); if (bloomPass) bloomPass.threshold = v; thVal.textContent = v.toFixed(3) })
+  thWrap.append(thLabel, thSlider, thVal)
+  ui.append(thWrap)
+
+  // --- Exposure control
+  const expWrap = document.createElement('div')
+  Object.assign(expWrap.style, {
+    display: 'grid',
+    gridTemplateColumns: 'auto 1fr 48px',
+    alignItems: 'center',
+    gap: '8px',
+    background: '#0b1220',
+    border: '1px solid #1f2a44',
+    borderRadius: '10px',
+    padding: '8px 10px'
+  } as Partial<CSSStyleDeclaration>)
+
+  const expLabel = document.createElement('label')
+  expLabel.textContent = 'Exposure'
+  expLabel.style.color = '#bfdbfe'
+  expLabel.style.font = '12px/1.2 system-ui'
+
+  const expSlider = document.createElement('input')
+  expSlider.type = 'range'
+  expSlider.min = '0'
+  expSlider.max = '3'
+  expSlider.step = '0.01'
+  expSlider.value = `${renderer.toneMappingExposure}`
+  expSlider.style.width = '160px'
+  expSlider.style.accentColor = '#60a5fa'
+
+  const expVal = document.createElement('span')
+  expVal.textContent = renderer.toneMappingExposure.toFixed(2)
+  expVal.style.color = '#e5e7eb'
+  expVal.style.font = '12px/1.2 system-ui'
+  expVal.style.textAlign = 'right'
+
+  expSlider.addEventListener('input', () => {
+    const v = Number(expSlider.value)
+    renderer.toneMappingExposure = v
+    expVal.textContent = v.toFixed(2)
+  })
+
+  expWrap.append(expLabel, expSlider, expVal)
+  ui.append(expWrap)
+
+  // --- Vignette controls
+  const vigWrap = document.createElement('div')
+  Object.assign(vigWrap.style, {
+    display: 'grid',
+    gridTemplateColumns: 'auto 1fr 48px',
+    alignItems: 'center',
+    gap: '8px',
+    background: '#0b1220',
+    border: '1px solid #1f2a44',
+    borderRadius: '10px',
+    padding: '8px 10px'
+  } as Partial<CSSStyleDeclaration>)
+
+  const vigLabel = document.createElement('label')
+  vigLabel.textContent = 'Vignette Darkness'
+  vigLabel.style.color = '#bfdbfe'
+  vigLabel.style.font = '12px/1.2 system-ui'
+
+  const vigSlider = document.createElement('input')
+  vigSlider.type = 'range'
+  vigSlider.min = '0'
+  vigSlider.max = '3'
+  vigSlider.step = '0.01'
+  vigSlider.value = '1.2'
+  vigSlider.style.width = '160px'
+  vigSlider.style.accentColor = '#60a5fa'
+
+  const vigVal = document.createElement('span')
+  vigVal.textContent = '1.20'
+  vigVal.style.color = '#e5e7eb'
+  vigVal.style.font = '12px/1.2 system-ui'
+  vigVal.style.textAlign = 'right'
+
+  vigSlider.addEventListener('input', () => {
+    const v = Number(vigSlider.value)
+    if (vignettePass) vignettePass.uniforms['darkness'].value = v
+    vigVal.textContent = v.toFixed(2)
+  })
+
+  vigWrap.append(vigLabel, vigSlider, vigVal)
+  ui.append(vigWrap)
 
   // --- animation loop
   renderer.setAnimationLoop(() => {
@@ -719,7 +1084,15 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       }
     }
 
-    renderer.render(scene, camera)
+    // 🔸 Render: use raw renderer in XR to avoid black screens
+    if (renderer.xr.isPresenting) {
+      renderer.autoClear = true
+      renderer.render(scene, camera)
+    } else {
+      renderer.autoClear = false
+      if (composer) composer.render()
+      else renderer.render(scene, camera)
+    }
   })
 
   // public API
