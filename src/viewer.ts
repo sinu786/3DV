@@ -10,6 +10,9 @@ import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass'
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass'
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass'
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass'
+import { VignetteShader } from 'three/examples/jsm/shaders/VignetteShader'
+
 
 // ---- constants
 // Note: 0.002m is 2mm; typical human eye height is ~1.6m.
@@ -135,46 +138,31 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     const pr = Math.min(window.devicePixelRatio, 2)
     const w = Math.max(1, mount.clientWidth)
     const h = Math.max(1, mount.clientHeight)
-
+  
     composer = new EffectComposer(renderer)
-    composer.setPixelRatio(pr)
-    composer.setSize(w, h)
-
+    composer.setPixelRatio(pr)   // DPR goes here
+    composer.setSize(w, h)       // CSS pixels here
+  
     renderPass = new RenderPass(scene, camera)
     composer.addPass(renderPass)
-
-    // Cinematic bloom (subtle by default)
-    // NOTE: keep threshold not too high to avoid “patchy” look on some tone mapping combos.
-    bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), /*strength*/ 0.22, /*radius*/ 0.55, /*threshold*/ 0.85)
+  
+    // Bloom at CSS pixel size (NOT multiplied by DPR).
+    bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.22, 0.55, 0.85)
     composer.addPass(bloomPass)
 
-    // Simple vignette via ShaderPass (optional – left initialized but disabled by default)
-    vignettePass = new ShaderPass({
-      uniforms: {
-        tDiffuse: { value: null },
-        offset:   { value: 1.0 },
-        darkness: { value: 1.0 },
-      },
-      vertexShader: /* glsl */`
-        varying vec2 vUv;
-        void main() { vUv = uv; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }
-      `,
-      fragmentShader: /* glsl */`
-        uniform sampler2D tDiffuse;
-        uniform float offset;
-        uniform float darkness;
-        varying vec2 vUv;
-        void main() {
-          vec4 texel = texture2D( tDiffuse, vUv );
-          float dist = distance(vUv, vec2(0.5));
-          texel.rgb *= smoothstep(0.9, offset, 1.0 - dist*darkness);
-          gl_FragColor = texel;
-        }
-      `
-    })
-    vignettePass.enabled = false
-    composer.addPass(vignettePass)
+// Vignette
+vignettePass = new ShaderPass(VignetteShader)
+vignettePass.uniforms['offset'].value = 1
+vignettePass.uniforms['darkness'].value = 1
+composer.addPass(vignettePass)
+
+
+  
+    // Output pass ensures proper tonemapping/color space & avoids artifacts
+    const outputPass = new OutputPass()
+    composer.addPass(outputPass)
   }
+  
   buildComposer()
 
   // first-person rig (yaw/pitch)
@@ -501,7 +489,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   scene.add(marker)
 
   // --- standing indicator (glow sprite + subtle point light)
-  const standLight = new THREE.PointLight(0xffaa66, 0.9, 3.0, 2.0)
+  const standLight = new THREE.PointLight(0xffaa66, 0.01, 5.0, 2.0)
   standLight.position.set(0, 0.1, 0)
   scene.add(standLight)
 
@@ -571,7 +559,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     const moved = (dx*dx + dy*dy) > (CLICK_PX*CLICK_PX)
     if (!moved && dtUp <= CLICK_MS && marker.visible) {
       moveTo(aimPoint, true)
-      standLight.intensity = 1.6
+      standLight.intensity = 0.5
     }
     isDragging = false
     dragging = false
@@ -706,19 +694,22 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   function doResize() {
     const w = Math.max(1, mount.clientWidth)
     const h = Math.max(1, mount.clientHeight)
+  
     renderer.setSize(w, h)
     camera.aspect = w / h
     camera.updateProjectionMatrix()
     stickNavFloorToMinY()
+  
     if (composer) {
       const pr = Math.min(window.devicePixelRatio, 2)
       composer.setPixelRatio(pr)
       composer.setSize(w, h)
       if (bloomPass && typeof bloomPass.setSize === 'function') {
-        bloomPass.setSize(w, h) // IMPORTANT: prevents “patchy”/dead bloom regions after resize
+        bloomPass.setSize(w, h)   // <- important: CSS pixels
       }
     }
   }
+  
   window.addEventListener('resize', doResize)
 
   // helpers
@@ -972,6 +963,8 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       marker.scale.set(s, 1, s)
     }
 
+    
+
     // smooth FOV tween toward target
     {
       const diff = targetFov - camera.fov
@@ -1010,6 +1003,90 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
 
   // FOV UI state init
   _mouseNDC.set(0, 0)
+
+  // Exposure control
+const expWrap = document.createElement('div')
+Object.assign(expWrap.style, {
+  display: 'grid',
+  gridTemplateColumns: 'auto 1fr 48px',
+  alignItems: 'center',
+  gap: '8px',
+  background: '#0b1220',
+  border: '1px solid #1f2a44',
+  borderRadius: '10px',
+  padding: '8px 10px'
+} as Partial<CSSStyleDeclaration>)
+
+const expLabel = document.createElement('label')
+expLabel.textContent = 'Exposure'
+expLabel.style.color = '#bfdbfe'
+expLabel.style.font = '12px/1.2 system-ui'
+
+const expSlider = document.createElement('input')
+expSlider.type = 'range'
+expSlider.min = '0'
+expSlider.max = '3'
+expSlider.step = '0.01'
+expSlider.value = `${renderer.toneMappingExposure}`
+expSlider.style.width = '160px'
+expSlider.style.accentColor = '#60a5fa'
+
+const expVal = document.createElement('span')
+expVal.textContent = renderer.toneMappingExposure.toFixed(2)
+expVal.style.color = '#e5e7eb'
+expVal.style.font = '12px/1.2 system-ui'
+expVal.style.textAlign = 'right'
+
+expSlider.addEventListener('input', () => {
+  const v = Number(expSlider.value)
+  renderer.toneMappingExposure = v
+  expVal.textContent = v.toFixed(2)
+})
+
+expWrap.append(expLabel, expSlider, expVal)
+ui.append(expWrap)
+// Vignette controls
+const vigWrap = document.createElement('div')
+Object.assign(vigWrap.style, {
+  display: 'grid',
+  gridTemplateColumns: 'auto 1fr 48px',
+  alignItems: 'center',
+  gap: '8px',
+  background: '#0b1220',
+  border: '1px solid #1f2a44',
+  borderRadius: '10px',
+  padding: '8px 10px'
+} as Partial<CSSStyleDeclaration>)
+
+const vigLabel = document.createElement('label')
+vigLabel.textContent = 'Vignette Darkness'
+vigLabel.style.color = '#bfdbfe'
+vigLabel.style.font = '12px/1.2 system-ui'
+
+const vigSlider = document.createElement('input')
+vigSlider.type = 'range'
+vigSlider.min = '0'
+vigSlider.max = '3'
+vigSlider.step = '0.01'
+vigSlider.value = '1.3'
+vigSlider.style.width = '160px'
+vigSlider.style.accentColor = '#60a5fa'
+
+const vigVal = document.createElement('span')
+vigVal.textContent = '1.30'
+vigVal.style.color = '#e5e7eb'
+vigVal.style.font = '12px/1.2 system-ui'
+vigVal.style.textAlign = 'right'
+
+vigSlider.addEventListener('input', () => {
+  const v = Number(vigSlider.value)
+  if (vignettePass) vignettePass.uniforms['darkness'].value = v
+  vigVal.textContent = v.toFixed(2)
+})
+
+vigWrap.append(vigLabel, vigSlider, vigVal)
+ui.append(vigWrap)
+
 
   return {
     renderer, scene, camera, rig, model, mount,
