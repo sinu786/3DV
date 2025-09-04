@@ -6,7 +6,7 @@ export default function App() {
   const mountRef = useRef<HTMLDivElement>(null)
   const [status, setStatus] = useState<string>('Loading…')
   const [handle, setHandle] = useState<ViewerHandle | null>(null)
-  const [scale, setScale] = useState<number>(0.25) // UI scale (25% by default)
+  const [scale, setScale] = useState<number>(2) // UI scale (25% by default)
 
   useEffect(() => {
     let cleanup = () => {}
@@ -15,7 +15,13 @@ export default function App() {
       try {
         const h = await initViewer(mountRef.current, {
           modelUrl: '/assets/model.glb',
-          hdriUrl: '/assets/studio_small_03_1k.hdr',
+          hdriUrl: '/assets/studio_small_0_1k.hdr',
+            // lightmap (single atlas)
+            hdriintesity: 1,
+        lightmapUrl: '/assets/lightmap.png',
+        lightmapIntensity: 1.0,
+
+
           showHDRIBackground: true,
           initialModelScale: scale, // start with UI scale
           navmeshUrl: '/assets/navmesh.glb', // <- teleport only on this mesh
@@ -26,7 +32,10 @@ export default function App() {
       } catch (e) {
         console.error(e)
         setStatus('Failed to initialize viewer')
+
+        
       }
+      
     })()
     return () => cleanup()
   }, []) // init once
@@ -85,7 +94,7 @@ export default function App() {
             id="scale"
             type="range"
             min={0.05}
-            max={2}
+            max={20}
             step={0.01}
             value={scale}
             onChange={(e) => setScale(parseFloat(e.target.value))}

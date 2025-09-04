@@ -5,8 +5,18 @@ import { ARButton } from 'three/examples/jsm/webxr/ARButton'
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader'
 
+// Postprocessing
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer'
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass'
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass'
+import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass'
+import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass'
+
 // ---- constants
-const DEFAULT_EYE_HEIGHT = 1
+// Note: 0.002m is 2mm; typical human eye height is ~1.6m.
+// You can override via cfg.initialEyeHeight.
+const DEFAULT_EYE_HEIGHT = .2
+
 const LOOK_SENS_MOUSE = 0.0022
 const LOOK_SENS_TOUCH = 0.005
 const LOOK_PITCH_LIMIT = THREE.MathUtils.degToRad(85)
@@ -24,12 +34,12 @@ const PINCH_ZOOM_SNAP = true
 // ---- temps
 const _tmpV = new THREE.Vector3()
 const _mouseNDC = new THREE.Vector2(0, 0)
+const _ray = new THREE.Ray()
 
 // Fallback floor helpers (only used if NO navmesh provided)
 const _floorPlane = new THREE.Plane()
 const _floorPosWS = new THREE.Vector3()
 const _floorNormalWS = new THREE.Vector3(0, 1, 0)
-const _ray = new THREE.Ray()
 
 // --- navmesh state
 let navmeshGroup: THREE.Group | null = null        // holds baked navmesh meshes (always visible for raycast)
@@ -41,11 +51,16 @@ const _modelAppliedXform = new THREE.Matrix4().identity()
 
 export type ViewerConfig = {
   modelUrl?: string
+  hdriintesity?: number
   hdriUrl?: string
   showHDRIBackground?: boolean
   initialModelScale?: number
   initialEyeHeight?: number
   navmeshUrl?: string // teleport only on this imported mesh
+
+  // Lightmap (supports HDR .hdr atlases)
+  lightmapUrl?: string
+  lightmapIntensity?: number
 }
 
 export type ViewerHandle = {
@@ -74,7 +89,13 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   renderer.setClearColor(0x0f1116, 1)
   renderer.outputColorSpace = THREE.SRGBColorSpace
   renderer.toneMapping = THREE.ACESFilmicToneMapping
-  renderer.toneMappingExposure = 1.0
+  renderer.toneMappingExposure = 1.1 // slight lift pairs nicely with bloom
+
+  // Soft shadows
+  renderer.shadowMap.enabled = true
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap
+
+  // WebXR
   renderer.xr.enabled = true
   try { renderer.xr.setReferenceSpaceType?.('local-floor') } catch {}
   mount.appendChild(renderer.domElement)
@@ -105,6 +126,33 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   camera.fov = targetFov
   camera.updateProjectionMatrix()
 
+  // --- postprocessing
+  let composer: EffectComposer | null = null
+  let renderPass: RenderPass
+  let smaaPass: SMAAPass
+  let bloomPass: UnrealBloomPass
+  let vignettePass: ShaderPass
+
+  function buildComposer() {
+    const pr = Math.min(window.devicePixelRatio, 2)
+    const w = Math.max(1, mount.clientWidth)
+    const h = Math.max(1, mount.clientHeight)
+
+    composer = new EffectComposer(renderer)
+    composer.setPixelRatio(pr)
+    composer.setSize(w, h)
+
+    renderPass = new RenderPass(scene, camera)
+    composer.addPass(renderPass)
+
+
+
+    // Cinematic bloom (subtle by default)
+    bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), /*strength*/ 0.22, /*radius*/ 0.55, /*threshold*/ 0.9)
+    composer.addPass(bloomPass)
+  }
+  buildComposer()
+
   // first-person rig (yaw/pitch)
   const rig = new THREE.Group(); rig.name = 'Rig'
   scene.add(rig)
@@ -120,11 +168,24 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   scene.add(world)
 
   // lighting
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x404040, 0.6))
-  const dir = new THREE.DirectionalLight(0xffffff, 0.7)
-  dir.position.set(5, 10, 5)
-  dir.castShadow = false
-  scene.add(dir)
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x404040, 0.55)
+  scene.add(hemi)
+
+  const sun = new THREE.DirectionalLight(0xffffff, 2.2)
+  sun.position.set(5, 10, 4)
+  sun.castShadow = true
+  // shadow quality & bounds
+  const res = 2048
+  sun.shadow.mapSize.set(res, res)
+  sun.shadow.radius = 2
+  sun.shadow.bias = -0.00015
+  sun.shadow.camera.near = 0.1
+  sun.shadow.camera.far = 50
+  sun.shadow.camera.left = -15
+  sun.shadow.camera.right = 15
+  sun.shadow.camera.top = 15
+  sun.shadow.camera.bottom = -15
+  scene.add(sun)
 
   // PMREM/HDRI
   const pmrem = new THREE.PMREMGenerator(renderer)
@@ -141,16 +202,39 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     } catch (e) { console.warn('[viewer] HDRI load failed (continuing)', e) }
   }
 
+  // Lightmap loader (HDR or LDR)
+  async function loadLightmapTexture(url: string): Promise<THREE.Texture> {
+    const isHDR = /\.hdr$/i.test(url)
+    let tex: THREE.Texture
+    if (isHDR) {
+      tex = await new RGBELoader().loadAsync(url) // linear HDR
+      tex.generateMipmaps = false
+      tex.minFilter = THREE.LinearFilter
+      tex.magFilter = THREE.LinearFilter
+    } else {
+      tex = await new THREE.TextureLoader().loadAsync(url) // likely LDR (linear assumed)
+      const maxAniso = (renderer.capabilities as any).getMaxAnisotropy?.() ?? 1
+      tex.anisotropy = maxAniso
+      // If your LDR lightmap is authored in sRGB, uncomment:
+      // ;(tex as any).colorSpace = THREE.SRGBColorSpace
+    }
+    tex.wrapS = THREE.ClampToEdgeWrapping
+    tex.wrapT = THREE.ClampToEdgeWrapping
+    tex.flipY = false
+    return tex
+  }
+
   // ---- fallback floor (used only if no navmesh)
   let navFloor: THREE.Mesh<THREE.PlaneGeometry, THREE.Material> | null = null
   function ensureNavFloor() {
     if (navFloor) return
     const mat = new THREE.MeshStandardMaterial({ transparent: true, opacity: 0, side: THREE.DoubleSide })
     mat.depthWrite = false
-    mat.colorWrite = false
+    ;(mat as any).colorWrite = false
     const geom = new THREE.PlaneGeometry(200, 200).rotateX(-Math.PI / 2)
     navFloor = new THREE.Mesh(geom, mat)
     navFloor.name = 'TeleportFloor'
+    navFloor.receiveShadow = true
     world.add(navFloor)
   }
   function stickNavFloorToMinY() {
@@ -175,6 +259,34 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   let model: THREE.Object3D | undefined
   let modelXform = new THREE.Matrix4().identity()
 
+  // Strict lightmap applier: requires uv2/TEXCOORD_1 present
+  function applyLightmapToRoot(root: THREE.Object3D, lm: THREE.Texture, lmIntensity: number) {
+    let applied = 0, missing = 0
+    root.traverse((o) => {
+      const mesh = o as THREE.Mesh<THREE.BufferGeometry, THREE.Material | THREE.Material[]>
+      if (!(mesh as any).isMesh || !mesh.geometry || !mesh.material) return
+
+      const geo = mesh.geometry
+      const uv2 = geo.getAttribute('uv2')
+      if (!uv2) { missing++; return } // skip — exporter must provide TEXCOORD_1
+
+      const apply = (mat: THREE.Material) => {
+        const std = mat as THREE.MeshStandardMaterial
+        if (!(std as any).isMeshStandardMaterial && !(std as any).isMeshPhysicalMaterial) return
+        std.lightMap = lm
+        std.lightMapIntensity = lmIntensity
+        std.dithering = true
+        std.needsUpdate = true
+        applied++
+      }
+      Array.isArray(mesh.material) ? mesh.material.forEach(apply) : apply(mesh.material)
+    })
+    if (missing) {
+      console.warn(`[viewer] lightmap skipped on ${missing} mesh(es) with no uv2. Ensure GLB exports TEXCOORD_1.`)
+    }
+    console.log(`[viewer] lightmap applied on ${applied} mesh(es) using uv2`)
+  }
+
   async function loadGLB(url: string) {
     const gltf = await new GLTFLoader().loadAsync(url)
     const root = gltf.scene as THREE.Object3D
@@ -187,7 +299,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       const inv = new THREE.Matrix4().copy(spawn.matrixWorld).invert()
       root.applyMatrix4(inv)
       modelXform.copy(inv)
-      _modelAppliedXform.copy(inv) // << remember model transform
+      _modelAppliedXform.copy(inv) // remember model transform
     } else {
       // Auto center/scale
       const box = new THREE.Box3().setFromObject(root)
@@ -200,12 +312,37 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       const T2 = new THREE.Matrix4().makeTranslation(0, 1.0, 0)
       modelXform.copy(T2).multiply(S).multiply(T1)
       root.applyMatrix4(modelXform)
-      _modelAppliedXform.copy(modelXform) // << remember model transform
+      _modelAppliedXform.copy(modelXform)
     }
+
+    // Shadows + dithering
+    root.traverse((o) => {
+      const m = o as THREE.Mesh
+      if ((m as any).isMesh) { m.castShadow = true; m.receiveShadow = true }
+      const mat = (o as any).material
+      const set = (mm: THREE.Material) => {
+        const std = mm as THREE.MeshStandardMaterial
+        if ((std as any).isMeshStandardMaterial || (std as any).isMeshPhysicalMaterial) {
+          std.dithering = true
+        }
+      }
+      if (Array.isArray(mat)) mat.forEach(set); else if (mat) set(mat)
+    })
 
     world.add(root)
     ensureNavFloor()
     stickNavFloorToMinY()
+
+    // Apply baked lightmap strictly (requires uv2)
+    if (cfg.lightmapUrl) {
+      try {
+        const lm = await loadLightmapTexture(cfg.lightmapUrl)
+        const lmIntensity = cfg.lightmapIntensity ?? 1.0
+        applyLightmapToRoot(root, lm, lmIntensity)
+      } catch (err) {
+        console.warn('[viewer] lightmap load/apply failed', err)
+      }
+    }
   }
 
   // NAVMESH loader (supports many child meshes). Keeps meshes VISIBLE for raycast, but non-rendering.
@@ -225,7 +362,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
           // Bake world transform AND the model's applied transform (so both align!)
           const baked = m.geometry.clone()
           baked.applyMatrix4(m.matrixWorld)
-          baked.applyMatrix4(_modelAppliedXform) // << align to model transform
+          baked.applyMatrix4(_modelAppliedXform)
           baked.deleteAttribute('normal')
           baked.deleteAttribute('uv')
           baked.computeBoundingBox()
@@ -237,7 +374,6 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
             transparent: true,
             opacity: 0.0,           // invisible by default
           })
-          // make it non-rendering but raycastable
           ;(mat as any).colorWrite = false
           ;(mat as any).depthWrite = false
 
@@ -292,6 +428,8 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
         new THREE.MeshStandardMaterial({ metalness: 0.2, roughness: 0.5 })
       )
       cube.position.y = 1.0
+      cube.castShadow = true
+      cube.receiveShadow = true
       world.add(cube)
       model = cube
       _modelAppliedXform.identity() // fallback: no special transform
@@ -302,6 +440,8 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       new THREE.MeshStandardMaterial({ metalness: 0.2, roughness: 0.5 })
     )
     cube.position.y = 1.0
+    cube.castShadow = true
+    cube.receiveShadow = true
     world.add(cube)
     model = cube
     _modelAppliedXform.identity()
@@ -546,6 +686,11 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     camera.aspect = w / h
     camera.updateProjectionMatrix()
     stickNavFloorToMinY()
+    if (composer) {
+      const pr = Math.min(window.devicePixelRatio, 2)
+      composer.setPixelRatio(pr)
+      composer.setSize(w, h)
+    }
   }
   window.addEventListener('resize', doResize)
 
@@ -554,7 +699,6 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     if (hit && navmeshGroup) {
       aimPoint.copy(hit.point)
       marker.quaternion.set(0, 0, 0, 1)
-      // ⬇️ show marker exactly where you’re aiming (local surface height)
       const y = hit.point.y + 0.01
       marker.position.set(aimPoint.x, y, aimPoint.z)
       marker.visible = true
@@ -568,14 +712,12 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       marker.visible = false
     }
   }
-  
 
   function moveTo(target: THREE.Vector3, smooth: boolean) {
     const dest = target.clone()
-    // ⬇️ still clamp to lowest Y on the navmesh
     const y = navmeshGroup ? (navmeshMinY ?? target.y) : (navFloor ? _floorPosWS.y : 0)
     dest.y = y
-  
+
     if (!smooth || renderer.xr.isPresenting) {
       rig.position.set(dest.x, 0, dest.z)
       moveTarget = null
@@ -583,7 +725,6 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       moveTarget = dest
     }
   }
-  
 
   // --- UI: FOV toggle buttons (18° / 35°)
   let activePreset: 18 | 35 | null = null
@@ -592,6 +733,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   ui.style.top = '12px'
   ui.style.right = '12px'
   ui.style.display = 'flex'
+  ui.style.flexDirection = 'column'
   ui.style.gap = '8px'
   ui.style.zIndex = '1000'
   const mkBtn = (label: string) => {
@@ -613,7 +755,13 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
 
   const btn18 = mkBtn('18°')
   const btn35 = mkBtn('35°')
-  ui.append(btn18, btn35)
+
+  const fovRow = document.createElement('div')
+  fovRow.style.display = 'flex'
+  fovRow.style.gap = '8px'
+  fovRow.append(btn18, btn35)
+
+  ui.append(fovRow)
   safeAppend(document.body, ui)
 
   function updateBtnStates() {
@@ -641,6 +789,54 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     setFovPresetInternal(activePreset === 35 ? null : 35)
   })
   updateBtnStates()
+
+  // --- Bloom controls (toggle + strength)
+  const bloomWrap = document.createElement('div')
+  bloomWrap.style.display = 'grid'
+  bloomWrap.style.gridTemplateColumns = 'auto 1fr 48px'
+  bloomWrap.style.alignItems = 'center'
+  bloomWrap.style.gap = '8px'
+  bloomWrap.style.background = '#0b1220'
+  bloomWrap.style.border = '1px solid #1f2a44'
+  bloomWrap.style.borderRadius = '10px'
+  bloomWrap.style.padding = '8px 10px'
+
+  const bloomLabel = document.createElement('label')
+  bloomLabel.style.color = '#bfdbfe'
+  bloomLabel.style.font = '12px/1.2 system-ui,-apple-system,Segoe UI,Inter,Roboto,sans-serif'
+  const chk = document.createElement('input')
+  chk.type = 'checkbox'
+  chk.checked = true
+  chk.style.marginRight = '6px'
+  bloomLabel.append(chk, document.createTextNode('Bloom'))
+
+  const bloomSlider = document.createElement('input')
+  bloomSlider.type = 'range'
+  bloomSlider.min = '0'
+  bloomSlider.max = '1'
+  bloomSlider.step = '0.01'
+  bloomSlider.value = '0.22'
+  bloomSlider.style.width = '160px'
+  bloomSlider.style.accentColor = '#60a5fa'
+
+  const bloomVal = document.createElement('span')
+  bloomVal.textContent = `${Number(bloomSlider.value).toFixed(2)}`
+  bloomVal.style.color = '#e5e7eb'
+  bloomVal.style.font = '12px/1.2 system-ui,-apple-system,Segoe UI,Inter,Roboto,sans-serif'
+  bloomVal.style.textAlign = 'right'
+
+  chk.addEventListener('change', () => {
+    ;(bloomPass as any).enabled = chk.checked
+  })
+
+  bloomSlider.addEventListener('input', () => {
+    const v = Number(bloomSlider.value)
+    bloomPass.strength = v
+    bloomVal.textContent = v.toFixed(2)
+  })
+
+  bloomWrap.append(bloomLabel, bloomSlider, bloomVal)
+  ui.append(bloomWrap)
 
   // --- animation loop
   renderer.setAnimationLoop(() => {
@@ -719,7 +915,8 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       }
     }
 
-    renderer.render(scene, camera)
+    if (composer) composer.render()
+    else renderer.render(scene, camera)
   })
 
   // public API
