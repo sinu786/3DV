@@ -5,17 +5,15 @@ import { ARButton } from 'three/examples/jsm/webxr/ARButton'
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader'
 
-// Postprocessing
+// Postprocessing (runtime-only; avoid using them as TS types)
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer'
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass'
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass'
-import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass'
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass'
 
 // ---- constants
 // Note: 0.002m is 2mm; typical human eye height is ~1.6m.
-// You can override via cfg.initialEyeHeight.
-const DEFAULT_EYE_HEIGHT = .2
+const DEFAULT_EYE_HEIGHT = 0.2
 
 const LOOK_SENS_MOUSE = 0.0022
 const LOOK_SENS_TOUCH = 0.005
@@ -105,12 +103,12 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   // VR/AR buttons (never throw)
   try {
     const vrBtn = VRButton.createButton(renderer)
-    Object.assign(vrBtn.style, { position: 'fixed', right: '12px', bottom: '12px' })
+    Object.assign(vrBtn.style, { position: 'fixed', right: '12px', bottom: '12px' } as Partial<CSSStyleDeclaration>)
     safeAppend(document.body, vrBtn)
   } catch (e) { console.warn('[viewer] VRButton failed', e) }
   try {
     const arBtn = ARButton.createButton(renderer, { requiredFeatures: [] })
-    Object.assign(arBtn.style, { position: 'fixed', right: '12px', bottom: '56px' })
+    Object.assign(arBtn.style, { position: 'fixed', right: '12px', bottom: '56px' } as Partial<CSSStyleDeclaration>)
     safeAppend(document.body, arBtn)
   } catch (e) { console.warn('[viewer] ARButton failed', e) }
 
@@ -127,11 +125,11 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   camera.updateProjectionMatrix()
 
   // --- postprocessing
-  let composer: EffectComposer | null = null
-  let renderPass: RenderPass
-  let smaaPass: SMAAPass
-  let bloomPass: UnrealBloomPass
-  let vignettePass: ShaderPass
+  // IMPORTANT: do NOT use imported classes as TS types here (no .d.ts). Use `any`.
+  let composer: any = null
+  let renderPass: any
+  let bloomPass: any
+  let vignettePass: any
 
   function buildComposer() {
     const pr = Math.min(window.devicePixelRatio, 2)
@@ -145,11 +143,37 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     renderPass = new RenderPass(scene, camera)
     composer.addPass(renderPass)
 
-
-
     // Cinematic bloom (subtle by default)
-    bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), /*strength*/ 0.22, /*radius*/ 0.55, /*threshold*/ 0.9)
+    // NOTE: keep threshold not too high to avoid “patchy” look on some tone mapping combos.
+    bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), /*strength*/ 0.22, /*radius*/ 0.55, /*threshold*/ 0.85)
     composer.addPass(bloomPass)
+
+    // Simple vignette via ShaderPass (optional – left initialized but disabled by default)
+    vignettePass = new ShaderPass({
+      uniforms: {
+        tDiffuse: { value: null },
+        offset:   { value: 1.0 },
+        darkness: { value: 1.0 },
+      },
+      vertexShader: /* glsl */`
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }
+      `,
+      fragmentShader: /* glsl */`
+        uniform sampler2D tDiffuse;
+        uniform float offset;
+        uniform float darkness;
+        varying vec2 vUv;
+        void main() {
+          vec4 texel = texture2D( tDiffuse, vUv );
+          float dist = distance(vUv, vec2(0.5));
+          texel.rgb *= smoothstep(0.9, offset, 1.0 - dist*darkness);
+          gl_FragColor = texel;
+        }
+      `
+    })
+    vignettePass.enabled = false
+    composer.addPass(vignettePass)
   }
   buildComposer()
 
@@ -690,6 +714,9 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
       const pr = Math.min(window.devicePixelRatio, 2)
       composer.setPixelRatio(pr)
       composer.setSize(w, h)
+      if (bloomPass && typeof bloomPass.setSize === 'function') {
+        bloomPass.setSize(w, h) // IMPORTANT: prevents “patchy”/dead bloom regions after resize
+      }
     }
   }
   window.addEventListener('resize', doResize)
@@ -726,7 +753,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
     }
   }
 
-  // --- UI: FOV toggle buttons (18° / 35°)
+  // --- UI: FOV toggle buttons (18° / 35°) + Bloom controls
   let activePreset: 18 | 35 | null = null
   const ui = document.createElement('div')
   ui.style.position = 'fixed'
@@ -790,7 +817,7 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   })
   updateBtnStates()
 
-  // --- Bloom controls (toggle + strength)
+  // --- Bloom controls (enable + strength + radius + threshold)
   const bloomWrap = document.createElement('div')
   bloomWrap.style.display = 'grid'
   bloomWrap.style.gridTemplateColumns = 'auto 1fr 48px'
@@ -801,42 +828,82 @@ export async function initViewer(mount: HTMLElement, cfg: ViewerConfig = {}): Pr
   bloomWrap.style.borderRadius = '10px'
   bloomWrap.style.padding = '8px 10px'
 
+  const bloomEnable = document.createElement('input')
+  bloomEnable.type = 'checkbox'
+  bloomEnable.checked = true
+  bloomEnable.style.marginRight = '6px'
+
   const bloomLabel = document.createElement('label')
   bloomLabel.style.color = '#bfdbfe'
   bloomLabel.style.font = '12px/1.2 system-ui,-apple-system,Segoe UI,Inter,Roboto,sans-serif'
-  const chk = document.createElement('input')
-  chk.type = 'checkbox'
-  chk.checked = true
-  chk.style.marginRight = '6px'
-  bloomLabel.append(chk, document.createTextNode('Bloom'))
+  bloomLabel.append(bloomEnable, document.createTextNode('Bloom'))
 
-  const bloomSlider = document.createElement('input')
-  bloomSlider.type = 'range'
-  bloomSlider.min = '0'
-  bloomSlider.max = '1'
-  bloomSlider.step = '0.01'
-  bloomSlider.value = '0.22'
-  bloomSlider.style.width = '160px'
-  bloomSlider.style.accentColor = '#60a5fa'
+  const bloomStrength = document.createElement('input')
+  bloomStrength.type = 'range'
+  bloomStrength.min = '0'
+  bloomStrength.max = '2'
+  bloomStrength.step = '0.01'
+  bloomStrength.value = '0.22'
+  bloomStrength.style.width = '160px'
+  bloomStrength.style.accentColor = '#60a5fa'
 
-  const bloomVal = document.createElement('span')
-  bloomVal.textContent = `${Number(bloomSlider.value).toFixed(2)}`
-  bloomVal.style.color = '#e5e7eb'
-  bloomVal.style.font = '12px/1.2 system-ui,-apple-system,Segoe UI,Inter,Roboto,sans-serif'
-  bloomVal.style.textAlign = 'right'
+  const bloomStrengthVal = document.createElement('span')
+  bloomStrengthVal.textContent = `${Number(bloomStrength.value).toFixed(2)}`
+  bloomStrengthVal.style.color = '#e5e7eb'
+  bloomStrengthVal.style.font = '12px/1.2 system-ui,-apple-system,Segoe UI,Inter,Roboto,sans-serif'
+  bloomStrengthVal.style.textAlign = 'right'
 
-  chk.addEventListener('change', () => {
-    ;(bloomPass as any).enabled = chk.checked
+  bloomEnable.addEventListener('change', () => { if (bloomPass) bloomPass.enabled = bloomEnable.checked })
+  bloomStrength.addEventListener('input', () => {
+    const v = Number(bloomStrength.value)
+    if (bloomPass) bloomPass.strength = v
+    bloomStrengthVal.textContent = v.toFixed(2)
   })
 
-  bloomSlider.addEventListener('input', () => {
-    const v = Number(bloomSlider.value)
-    bloomPass.strength = v
-    bloomVal.textContent = v.toFixed(2)
-  })
-
-  bloomWrap.append(bloomLabel, bloomSlider, bloomVal)
+  bloomWrap.append(bloomLabel, bloomStrength, bloomStrengthVal)
   ui.append(bloomWrap)
+
+  // Radius control
+  const radiusWrap = document.createElement('div')
+  Object.assign(radiusWrap.style, {
+    display: 'grid',
+    gridTemplateColumns: 'auto 1fr 48px',
+    alignItems: 'center',
+    gap: '8px',
+    background: '#0b1220',
+    border: '1px solid #1f2a44',
+    borderRadius: '10px',
+    padding: '8px 10px'
+  } as Partial<CSSStyleDeclaration>)
+  const radiusLabel = document.createElement('label'); radiusLabel.textContent = 'Bloom Radius'; radiusLabel.style.color = '#bfdbfe'; radiusLabel.style.font = '12px/1.2 system-ui'
+  const radiusSlider = document.createElement('input')
+  radiusSlider.type = 'range'; radiusSlider.min = '0'; radiusSlider.max = '1.5'; radiusSlider.step = '0.01'; radiusSlider.value = '0.55'
+  radiusSlider.style.width = '160px'; radiusSlider.style.accentColor = '#60a5fa'
+  const radiusVal = document.createElement('span'); radiusVal.textContent = '0.55'; radiusVal.style.color = '#e5e7eb'; radiusVal.style.font = '12px/1.2 system-ui'; radiusVal.style.textAlign = 'right'
+  radiusSlider.addEventListener('input', () => { const v = Number(radiusSlider.value); if (bloomPass) bloomPass.radius = v; radiusVal.textContent = v.toFixed(2) })
+  radiusWrap.append(radiusLabel, radiusSlider, radiusVal)
+  ui.append(radiusWrap)
+
+  // Threshold control
+  const thWrap = document.createElement('div')
+  Object.assign(thWrap.style, {
+    display: 'grid',
+    gridTemplateColumns: 'auto 1fr 48px',
+    alignItems: 'center',
+    gap: '8px',
+    background: '#0b1220',
+    border: '1px solid #1f2a44',
+    borderRadius: '10px',
+    padding: '8px 10px'
+  } as Partial<CSSStyleDeclaration>)
+  const thLabel = document.createElement('label'); thLabel.textContent = 'Bloom Threshold'; thLabel.style.color = '#bfdbfe'; thLabel.style.font = '12px/1.2 system-ui'
+  const thSlider = document.createElement('input')
+  thSlider.type = 'range'; thSlider.min = '0'; thSlider.max = '1'; thSlider.step = '0.001'; thSlider.value = '0.85'
+  thSlider.style.width = '160px'; thSlider.style.accentColor = '#60a5fa'
+  const thVal = document.createElement('span'); thVal.textContent = '0.85'; thVal.style.color = '#e5e7eb'; thVal.style.font = '12px/1.2 system-ui'; thVal.style.textAlign = 'right'
+  thSlider.addEventListener('input', () => { const v = Number(thSlider.value); if (bloomPass) bloomPass.threshold = v; thVal.textContent = v.toFixed(3) })
+  thWrap.append(thLabel, thSlider, thVal)
+  ui.append(thWrap)
 
   // --- animation loop
   renderer.setAnimationLoop(() => {
